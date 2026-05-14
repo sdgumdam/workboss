@@ -29,10 +29,18 @@ import {
 	discoverAll,
 	type DiscoveredSession,
 } from './lib/discovery.js';
+import {
+	fmtAge,
+	pickUniqueName,
+	shortCwd,
+	shortSid,
+} from './lib/format.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// ---------- io helpers ----------
+// ============================================================================
+// io / common helpers
+// ============================================================================
 
 function fail(msg: string): never {
 	console.error(`workboss: ${msg}`);
@@ -41,6 +49,14 @@ function fail(msg: string): never {
 
 function ok(msg: string): void {
 	console.log(msg);
+}
+
+async function loadWorker(name: string): Promise<WorkerMeta> {
+	try {
+		return await readWorkerMeta(name);
+	} catch {
+		fail(`worker "${name}" not found`);
+	}
 }
 
 async function ensureServerUp(): Promise<string> {
@@ -78,13 +94,55 @@ async function createWorkerScaffold(
 }
 
 async function notifyAggregator(name: string): Promise<void> {
-	const attached = await rpcCall({kind: 'workers.attach', name});
-	if (!attached.ok) {
-		console.warn(`workboss: aggregator could not attach: ${attached.error}`);
+	const r = await rpcCall({kind: 'workers.attach', name});
+	if (!r.ok) console.warn(`workboss: aggregator could not attach: ${r.error}`);
+}
+
+/**
+ * SIGTERM, wait up to `graceMs`, then SIGKILL. Quietly no-ops when the
+ * process is already gone.
+ */
+async function gracefulKill(pid: number, graceMs = 2000): Promise<void> {
+	if (!isProcessAlive(pid)) return;
+	try {
+		process.kill(pid, 'SIGTERM');
+		ok(`sent SIGTERM to pid=${pid}`);
+	} catch {
+		return; // already gone
+	}
+	const deadline = Date.now() + graceMs;
+	while (Date.now() < deadline && isProcessAlive(pid)) {
+		await new Promise(r => setTimeout(r, 100));
+	}
+	if (isProcessAlive(pid)) {
+		try {
+			process.kill(pid, 'SIGKILL');
+			ok(`escalated to SIGKILL`);
+		} catch {
+			/* ignore */
+		}
 	}
 }
 
-// ---------- server lifecycle ----------
+function processFromUrl(url: string): WorkerMeta['process'] | undefined {
+	if (!url) return undefined;
+	const startedAt = new Date().toISOString();
+	try {
+		const u = new URL(url);
+		const port = parseInt(u.port, 10);
+		return {
+			serverUrl: url,
+			serverPort: Number.isFinite(port) ? port : undefined,
+			startedAt,
+		};
+	} catch {
+		return {serverUrl: url, startedAt};
+	}
+}
+
+// ============================================================================
+// server lifecycle
+// ============================================================================
 
 export async function serverStart(): Promise<void> {
 	ensureRoot();
@@ -133,14 +191,16 @@ export async function serverStatus(): Promise<void> {
 		return;
 	}
 	ok(`workboss server running, pid=${pid}, http port=${port ?? '?'}`);
-	const res = await rpcCall({kind: 'ping'});
-	if (res.ok && res.data && typeof res.data === 'object') {
-		const d = res.data as {pid: number; workers: number};
+	const r = await rpcCall({kind: 'ping'});
+	if (r.ok && r.data && typeof r.data === 'object') {
+		const d = r.data as {pid: number; workers: number};
 		ok(`  attached workers: ${d.workers}`);
 	}
 }
 
-// ---------- worker spawn ----------
+// ============================================================================
+// worker spawn / register / lifecycle
+// ============================================================================
 
 export interface SpawnArgs {
 	name: string;
@@ -153,9 +213,8 @@ export interface SpawnArgs {
 
 export async function spawnWorker(args: SpawnArgs): Promise<void> {
 	ensureRoot();
-	const agent: AgentKind = args.agent ?? 'opencode';
+	const agent = args.agent ?? 'opencode';
 	const adapter = getAdapter(agent);
-
 	if (!existsSync(args.cwd)) fail(`cwd does not exist: ${args.cwd}`);
 	const cwdAbs = path.resolve(args.cwd);
 
@@ -163,14 +222,8 @@ export async function spawnWorker(args: SpawnArgs): Promise<void> {
 	const missionBody = await resolveMissionBody(args);
 	await createWorkerScaffold(args.name, missionBody);
 
-	const startedAt = new Date().toISOString();
-	let meta: WorkerMeta = {
-		name: args.name,
-		agent,
-		cwd: cwdAbs,
-		createdAt: startedAt,
-	};
-	await writeWorkerMeta(meta);
+	const createdAt = new Date().toISOString();
+	await writeWorkerMeta({name: args.name, agent, cwd: cwdAbs, createdAt});
 
 	const result = await adapter.spawnNew({
 		workerName: args.name,
@@ -179,14 +232,14 @@ export async function spawnWorker(args: SpawnArgs): Promise<void> {
 		workbossServerUrl,
 		preferredPort: args.port,
 	});
-
-	meta = {
-		...meta,
+	await writeWorkerMeta({
+		name: args.name,
+		agent,
+		cwd: cwdAbs,
+		createdAt,
 		sessionId: result.sessionId,
 		process: result.process,
-	};
-	await writeWorkerMeta(meta);
-
+	});
 	await notifyAggregator(args.name);
 
 	ok(`worker "${args.name}" ${result.process?.pid ? 'up' : 'registered'}`);
@@ -194,8 +247,6 @@ export async function spawnWorker(args: SpawnArgs): Promise<void> {
 	ok(`  cwd        : ${cwdAbs}`);
 	for (const line of result.postSpawnHint) ok(line);
 }
-
-// ---------- register (adopt existing session) ----------
 
 export interface RegisterArgs {
 	name: string;
@@ -205,22 +256,11 @@ export interface RegisterArgs {
 	serverUrl?: string;
 }
 
-function portFromUrl(url: string): number | undefined {
-	try {
-		const u = new URL(url);
-		const p = parseInt(u.port, 10);
-		return Number.isFinite(p) ? p : undefined;
-	} catch {
-		return undefined;
-	}
-}
-
 export async function registerWorker(args: RegisterArgs): Promise<void> {
 	ensureRoot();
 	const adapter = getAdapter(args.agent);
 	if (!existsSync(args.cwd)) fail(`cwd does not exist: ${args.cwd}`);
 	const cwdAbs = path.resolve(args.cwd);
-
 	const workbossServerUrl = await ensureServerUp();
 
 	await createWorkerScaffold(
@@ -233,23 +273,15 @@ export async function registerWorker(args: RegisterArgs): Promise<void> {
 		workbossServerUrl,
 	});
 
-	const meta: WorkerMeta = {
+	await writeWorkerMeta({
 		name: args.name,
 		agent: args.agent,
 		cwd: cwdAbs,
 		createdAt: new Date().toISOString(),
 		sessionId: args.sessionId,
-		process: args.serverUrl
-			? {
-					serverUrl: args.serverUrl,
-					serverPort: portFromUrl(args.serverUrl),
-					startedAt: new Date().toISOString(),
-				}
-			: undefined,
+		process: args.serverUrl ? processFromUrl(args.serverUrl) : undefined,
 		notes: 'registered',
-	};
-	await writeWorkerMeta(meta);
-
+	});
 	await notifyAggregator(args.name);
 
 	ok(`registered "${args.name}"`);
@@ -259,53 +291,27 @@ export async function registerWorker(args: RegisterArgs): Promise<void> {
 	if (args.serverUrl) ok(`  server     : ${args.serverUrl}`);
 }
 
-// ---------- attach / detach / remove ----------
-
 export async function attachWorker(name: string): Promise<void> {
-	const meta = await readWorkerMeta(name).catch(() => null);
-	if (!meta) fail(`worker "${name}" not found`);
-	for (const line of getAdapter(meta!.agent).attachHint(meta!)) ok(line);
+	const meta = await loadWorker(name);
+	for (const line of getAdapter(meta.agent).attachHint(meta)) ok(line);
 }
 
 export async function detachWorker(name: string): Promise<void> {
-	const meta = await readWorkerMeta(name).catch(() => null);
-	if (!meta) fail(`worker "${name}" not found`);
-
+	const meta = await loadWorker(name);
 	await rpcCall({kind: 'workers.detach', name});
-
-	const pid = meta!.process?.pid;
-	if (pid && isProcessAlive(pid)) {
-		try {
-			process.kill(pid, 'SIGTERM');
-			ok(`sent SIGTERM to pid=${pid}`);
-			const deadline = Date.now() + 2000;
-			while (Date.now() < deadline && isProcessAlive(pid)) {
-				await new Promise(r => setTimeout(r, 100));
-			}
-			if (isProcessAlive(pid)) {
-				process.kill(pid, 'SIGKILL');
-				ok(`escalated to SIGKILL`);
-			}
-		} catch (err) {
-			console.warn(`failed to kill pid ${pid}: ${String(err)}`);
-		}
-	}
-
+	if (meta.process?.pid) await gracefulKill(meta.process.pid);
 	await updateWorkerMeta(name, m => {
-		const next = {...m};
-		delete next.process;
-		return next;
+		const {process: _omit, ...rest} = m;
+		return rest;
 	});
-
 	ok(
-		`detached "${name}" (session ${meta!.sessionId ?? '?'} preserved; resume with \`workboss attach ${name}\`)`,
+		`detached "${name}" (session ${meta.sessionId ?? '?'} preserved; resume with \`workboss attach ${name}\`)`,
 	);
 }
 
 export async function removeWorker(name: string): Promise<void> {
-	const meta = await readWorkerMeta(name).catch(() => null);
-	if (!meta) fail(`worker "${name}" not found`);
-	if (meta!.process?.pid && isProcessAlive(meta!.process.pid)) {
+	const meta = await loadWorker(name);
+	if (meta.process?.pid && isProcessAlive(meta.process.pid)) {
 		await detachWorker(name);
 	} else {
 		await rpcCall({kind: 'workers.detach', name});
@@ -314,7 +320,14 @@ export async function removeWorker(name: string): Promise<void> {
 	ok(`removed worker "${name}" (session data on disk is untouched)`);
 }
 
-// ---------- inspection ----------
+// ============================================================================
+// inspection
+// ============================================================================
+
+function workerStatusLabel(w: WorkerMeta): string {
+	if (!w.process?.pid) return 'idle ';
+	return isProcessAlive(w.process.pid) ? 'up   ' : 'dead ';
+}
 
 export async function listWorkersCmd(): Promise<void> {
 	const ws = await listWorkers();
@@ -323,13 +336,10 @@ export async function listWorkersCmd(): Promise<void> {
 		return;
 	}
 	for (const w of ws) {
-		const procPid = w.process?.pid;
-		const procAlive = procPid ? isProcessAlive(procPid) : false;
-		const status = !procPid ? 'idle ' : procAlive ? 'up   ' : 'dead ';
-		const sid = w.sessionId ? w.sessionId.slice(0, 12) + '…' : '(no-sid)';
+		const sid = shortSid(w.sessionId).padEnd(15);
 		const where = w.process?.serverUrl ?? w.cwd;
 		ok(
-			`${status}  ${w.name.padEnd(20)}  ${w.agent.padEnd(8)}  ${sid.padEnd(15)}  ${where}`,
+			`${workerStatusLabel(w)}  ${w.name.padEnd(20)}  ${w.agent.padEnd(8)}  ${sid}  ${where}`,
 		);
 	}
 	if (!(await readServerPort())) {
@@ -339,13 +349,12 @@ export async function listWorkersCmd(): Promise<void> {
 }
 
 export async function showWorker(name: string): Promise<void> {
-	const meta = await readWorkerMeta(name).catch(() => null);
-	if (!meta) fail(`worker "${name}" not found`);
+	const meta = await loadWorker(name);
 	ok(JSON.stringify(meta, null, 2));
 }
 
 export async function messageWorker(name: string, text: string): Promise<void> {
-	await readWorkerMeta(name).catch(() => fail(`worker "${name}" not found`));
+	await loadWorker(name);
 	const stamp = new Date().toISOString();
 	await fs.appendFile(
 		workerInboxPath(name),
@@ -356,121 +365,178 @@ export async function messageWorker(name: string, text: string): Promise<void> {
 }
 
 export async function tailWorker(name: string, n: number): Promise<void> {
-	const meta = await readWorkerMeta(name).catch(() => null);
-	if (!meta) fail(`worker "${name}" not found`);
+	const meta = await loadWorker(name);
 	try {
-		ok(await getAdapter(meta!.agent).tail({meta: meta!, n}));
+		ok(await getAdapter(meta.agent).tail({meta, n}));
 	} catch (err) {
 		fail(err instanceof Error ? err.message : String(err));
 	}
 }
 
-// ---------- approvals ----------
+// ============================================================================
+// approvals
+// ============================================================================
+
+interface ApprovalRow {
+	id: string;
+	worker: string;
+	permission: string;
+	patterns: string[];
+	capturedAt?: string;
+}
+
+function formatApprovalRow(a: ApprovalRow): string {
+	const age = a.capturedAt
+		? `${Math.floor((Date.now() - new Date(a.capturedAt).getTime()) / 1000)}s`
+		: '?';
+	return `${a.id}  ${a.worker.padEnd(20)}  ${a.permission.padEnd(8)}  ${age.padEnd(5)}  ${JSON.stringify(a.patterns)}`;
+}
 
 export async function approvalsList(): Promise<void> {
-	const port = await readServerPort();
-	if (port === null) {
-		const local = await listPendingApprovals();
-		if (local.length === 0) {
-			ok('(no pending approvals; workboss server is not running)');
-			return;
-		}
-		for (const a of local) {
-			ok(
-				`${a.id}  ${a.worker.padEnd(20)}  ${a.permission}  ${JSON.stringify(a.patterns)}`,
-			);
-		}
-		return;
-	}
-	const res = await rpcCall({kind: 'approvals.list'});
-	if (!res.ok) fail(res.error);
-	const list = (res.data ?? []) as Array<{
-		id: string;
-		worker: string;
-		permission: string;
-		patterns: string[];
-		capturedAt: string;
-	}>;
+	const serverUp = (await readServerPort()) !== null;
+	const list = serverUp
+		? await (async () => {
+				const r = await rpcCall({kind: 'approvals.list'});
+				if (!r.ok) fail(r.error);
+				return (r.data ?? []) as ApprovalRow[];
+			})()
+		: ((await listPendingApprovals()) as ApprovalRow[]);
+
 	if (list.length === 0) {
-		ok('(no pending approvals)');
+		ok(
+			serverUp
+				? '(no pending approvals)'
+				: '(no pending approvals; workboss server is not running)',
+		);
 		return;
 	}
-	for (const a of list) {
-		const age = Math.floor(
-			(Date.now() - new Date(a.capturedAt).getTime()) / 1000,
-		);
-		ok(
-			`${a.id}  ${a.worker.padEnd(20)}  ${a.permission.padEnd(8)}  ${age}s  ${JSON.stringify(a.patterns)}`,
-		);
-	}
+	for (const a of list) ok(formatApprovalRow(a));
 }
 
 export async function approve(id: string, always: boolean): Promise<void> {
-	const res = await rpcCall({
+	const r = await rpcCall({
 		kind: 'approvals.reply',
 		id,
 		reply: always ? 'always' : 'once',
 	});
-	if (!res.ok) fail(res.error);
+	if (!r.ok) fail(r.error);
 	ok(`approved ${id} (${always ? 'always' : 'once'})`);
 }
 
 export async function reject(id: string, reason: string): Promise<void> {
-	const res = await rpcCall({
+	const r = await rpcCall({
 		kind: 'approvals.reply',
 		id,
 		reply: 'reject',
 		message: reason,
 	});
-	if (!res.ok) fail(res.error);
+	if (!r.ok) fail(r.error);
 	ok(`rejected ${id}`);
 }
 
-// ---------- discover ----------
+// ============================================================================
+// discover
+// ============================================================================
 
-function suggestName(d: DiscoveredSession, taken: Set<string>): string {
-	const base = d.sessionId
-		? `disc-${d.sessionId.replace(/^ses_/, '').slice(0, 8)}`
-		: d.cwd
-			? `disc-${path.basename(d.cwd).slice(0, 12)}`
-			: `disc-${d.agent}`;
-	let name = base;
-	let n = 2;
-	while (taken.has(name)) name = `${base}-${n++}`;
-	return name;
+interface KnownIndex {
+	sids: Set<string>;
+	urls: Set<string>;
+	names: Set<string>;
 }
 
-function fmtAge(d?: Date): string {
-	if (!d) return '?';
-	const ms = Date.now() - d.getTime();
-	if (ms < 0) return 'just now';
-	const sec = Math.floor(ms / 1000);
-	if (sec < 60) return `${sec}s 前`;
-	const min = Math.floor(sec / 60);
-	if (min < 60) return `${min}m 前`;
-	const hr = Math.floor(min / 60);
-	if (hr < 24) return `${hr}h 前`;
-	const day = Math.floor(hr / 24);
-	if (day < 30) return `${day}d 前`;
-	const mo = Math.floor(day / 30);
-	if (mo < 12) return `${mo}mo 前`;
-	return `${Math.floor(mo / 12)}y 前`;
+async function indexKnownWorkers(): Promise<KnownIndex> {
+	const ws = await listWorkers();
+	return {
+		sids: new Set(ws.map(w => w.sessionId).filter((s): s is string => !!s)),
+		urls: new Set(
+			ws.map(w => w.process?.serverUrl).filter((u): u is string => !!u),
+		),
+		names: new Set(ws.map(w => w.name)),
+	};
 }
 
-function shortSid(sid?: string): string {
-	if (!sid) return '(no-sid)';
-	return sid.startsWith('ses_')
-		? sid.slice(0, 12) + '…'
-		: sid.slice(0, 8) + '…';
+function partitionUnknown(
+	all: DiscoveredSession[],
+	known: KnownIndex,
+): {alive: DiscoveredSession[]; history: DiscoveredSession[]} {
+	const unknown = all.filter(d => {
+		if (d.sessionId && known.sids.has(d.sessionId)) return false;
+		if (d.serverUrl && known.urls.has(d.serverUrl)) return false;
+		return true;
+	});
+	return {
+		alive: unknown.filter(d => d.alive),
+		history: unknown.filter(d => !d.alive),
+	};
 }
 
-function shortCwd(cwd: string | undefined, maxLen = 40): string {
-	if (!cwd) return '?';
-	const home = process.env['HOME'];
-	let out = cwd;
-	if (home && cwd.startsWith(home)) out = '~' + cwd.slice(home.length);
-	if (out.length <= maxLen) return out;
-	return '…' + out.slice(out.length - (maxLen - 1));
+function printAliveSection(alive: DiscoveredSession[]): void {
+	if (alive.length === 0) return;
+	ok('可立即收编 (alive, 未注册):');
+	for (const d of alive) {
+		const where = d.serverUrl ?? (d.pid ? `pid ${d.pid}` : '?');
+		ok(
+			`  ${d.agent.padEnd(8)}  ${where.padEnd(28)}  ${shortCwd(d.cwd, 35).padEnd(37)}  ${shortSid(d.sessionId)}`,
+		);
+	}
+}
+
+function printHistorySection(
+	history: DiscoveredSession[],
+	opts: {limit: number; showFull: boolean},
+): void {
+	if (!opts.showFull || history.length === 0) return;
+	ok('');
+	ok('历史 session (idle, 未注册):');
+	for (const d of history.slice(0, opts.limit)) {
+		const title = d.title ? ` ("${d.title.slice(0, 30)}")` : '';
+		ok(
+			`  ${d.agent.padEnd(8)}  ${shortCwd(d.cwd, 35).padEnd(37)}  ${shortSid(d.sessionId).padEnd(15)}  ${fmtAge(d.lastActivity)}${title}`,
+		);
+	}
+	if (history.length > opts.limit) {
+		ok(`  ... 还有 ${history.length - opts.limit} 条 (--json 拿完整列表)`);
+	}
+}
+
+function nameSuggestion(d: DiscoveredSession): string {
+	if (d.sessionId) {
+		return `disc-${d.sessionId.replace(/^ses_/, '').slice(0, 8)}`;
+	}
+	if (d.cwd) return `disc-${path.basename(d.cwd).slice(0, 12)}`;
+	return `disc-${d.agent}`;
+}
+
+async function autoRegisterAlive(
+	alive: DiscoveredSession[],
+	taken: Set<string>,
+): Promise<void> {
+	for (const d of alive) {
+		if (!d.cwd) {
+			ok(`  ✗ ${d.agent} pid=${d.pid}: 无法拿到 cwd，跳过`);
+			continue;
+		}
+		if (!d.sessionId) {
+			ok(
+				`  ✗ ${d.agent} pid=${d.pid} (${d.cwd}): 无 session id，请等 worker 内一次工具调用让 workboss 学习，或手动 register`,
+			);
+			continue;
+		}
+		const name = pickUniqueName(nameSuggestion(d), taken);
+		taken.add(name);
+		try {
+			await registerWorker({
+				name,
+				agent: d.agent,
+				cwd: d.cwd,
+				sessionId: d.sessionId,
+				serverUrl: d.serverUrl,
+			});
+			ok(`  ✓ ${name}  ${d.agent}  ${shortSid(d.sessionId)}`);
+		} catch (err) {
+			ok(`  ✗ ${name}: ${err instanceof Error ? err.message : String(err)}`);
+		}
+	}
 }
 
 export interface DiscoverOptions {
@@ -480,25 +546,11 @@ export interface DiscoverOptions {
 }
 
 export async function discoverCmd(opts: DiscoverOptions): Promise<void> {
-	const known = await listWorkers();
-	const knownSids = new Set(
-		known.map(w => w.sessionId).filter((s): s is string => !!s),
-	);
-	const knownUrls = new Set(
-		known.map(w => w.process?.serverUrl).filter((u): u is string => !!u),
-	);
-	const knownNames = new Set(known.map(w => w.name));
-
-	const unknown = (await discoverAll()).filter(d => {
-		if (d.sessionId && knownSids.has(d.sessionId)) return false;
-		if (d.serverUrl && knownUrls.has(d.serverUrl)) return false;
-		return true;
-	});
-	const alive = unknown.filter(d => d.alive);
-	const history = unknown.filter(d => !d.alive);
+	const known = await indexKnownWorkers();
+	const {alive, history} = partitionUnknown(await discoverAll(), known);
 
 	if (opts.json) {
-		ok(JSON.stringify({alive, history, known: known.length}, null, 2));
+		ok(JSON.stringify({alive, history, known: known.names.size}, null, 2));
 		return;
 	}
 
@@ -510,29 +562,9 @@ export async function discoverCmd(opts: DiscoverOptions): Promise<void> {
 		return;
 	}
 
-	if (alive.length > 0) {
-		ok('可立即收编 (alive, 未注册):');
-		for (const d of alive) {
-			const where = d.serverUrl ?? (d.pid ? `pid ${d.pid}` : '?');
-			ok(
-				`  ${d.agent.padEnd(8)}  ${where.padEnd(28)}  ${shortCwd(d.cwd, 35).padEnd(37)}  ${shortSid(d.sessionId)}`,
-			);
-		}
-	}
-
-	if (opts.all && history.length > 0) {
-		ok('');
-		ok('历史 session (idle, 未注册):');
-		for (const d of history.slice(0, 50)) {
-			const title = d.title ? ` ("${d.title.slice(0, 30)}")` : '';
-			ok(
-				`  ${d.agent.padEnd(8)}  ${shortCwd(d.cwd, 35).padEnd(37)}  ${shortSid(d.sessionId).padEnd(15)}  ${fmtAge(d.lastActivity)}${title}`,
-			);
-		}
-		if (history.length > 50) {
-			ok(`  ... 还有 ${history.length - 50} 条 (--json 拿完整列表)`);
-		}
-	} else if (!opts.all && history.length > 0) {
+	printAliveSection(alive);
+	printHistorySection(history, {limit: 50, showFull: !!opts.all});
+	if (!opts.all && history.length > 0) {
 		ok('');
 		ok(`(另有 ${history.length} 个历史 session 未注册；--all 查看)`);
 	}
@@ -540,37 +572,13 @@ export async function discoverCmd(opts: DiscoverOptions): Promise<void> {
 	if (opts.registerAlive && alive.length > 0) {
 		ok('');
 		ok('--register-alive: 自动收编 alive worker:');
-		const taken = new Set(knownNames);
-		for (const d of alive) {
-			if (!d.cwd) {
-				ok(`  ✗ ${d.agent} pid=${d.pid}: 无法拿到 cwd，跳过`);
-				continue;
-			}
-			if (!d.sessionId) {
-				ok(
-					`  ✗ ${d.agent} pid=${d.pid} (${d.cwd}): 无 session id，请等 worker 内一次工具调用让 workboss 学习，或手动 register`,
-				);
-				continue;
-			}
-			const name = suggestName(d, taken);
-			taken.add(name);
-			try {
-				await registerWorker({
-					name,
-					agent: d.agent,
-					cwd: d.cwd,
-					sessionId: d.sessionId,
-					serverUrl: d.serverUrl,
-				});
-				ok(`  ✓ ${name}  ${d.agent}  ${shortSid(d.sessionId)}`);
-			} catch (err) {
-				ok(`  ✗ ${name}: ${err instanceof Error ? err.message : String(err)}`);
-			}
-		}
+		await autoRegisterAlive(alive, new Set(known.names));
 	}
 }
 
-// ---------- help ----------
+// ============================================================================
+// help
+// ============================================================================
 
 export function printHelp(): void {
 	ok(`workboss — LLM-supervised worker fleet (opencode + claude code)
