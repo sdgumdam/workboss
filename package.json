@@ -1,0 +1,25 @@
+{
+  "name": "workboss",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "LLM-driven supervisor that babysits multiple long-lived OpenCode / Claude Code worker sessions",
+  "bin": {
+    "workboss": "./bin/workboss.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src",
+    "lint:fix": "eslint src --fix",
+    "test": "vitest run"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.0.0",
+    "eslint": "^9.0.0",
+    "@typescript-eslint/eslint-plugin": "^8.0.0",
+    "@typescript-eslint/parser": "^8.0.0"
+  }
+}
