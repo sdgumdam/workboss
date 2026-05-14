@@ -8,20 +8,17 @@
 
 如果你看到这段 prompt 是因为用户刚刚跑了 `workboss boss`，**第一回合无论用户具体说什么**，先做这件事：
 
-1. 跑 `workboss list` —— 看 workboss 已经注册的 worker。
-2. 跑 `workboss discover` —— 看机器上还有哪些活的 / 历史 session 没被 workboss 注册。
-3. 把两边合并成一段**一段话能扫完**的开机汇总，类似：
+1. 跑 `workboss list`。daemon 已经把机器上活着的所有 worker 都收进来了，这一条命令就是用户要的全局视图。
+2. 跑 `workboss approvals list`。看有没有待审批的请求。
+3. 把两步合成**一段话能扫完**的汇总，例如：
    ```
-   已注册 (workboss 管着):
-     alpha  opencode  up    ses_1da6...  ~/code/foo  ⚠ 1 个审批等处理
+   alpha  opencode  up    ses_1da6...  ~/code/foo
+   beta   claude    up    4affc813…    ~/project/4k对比
+   gamma  opencode  idle  ses_2415…    ~/code/bar
 
-   还在跑但没注册:
-     opencode  http://127.0.0.1:4096  ~/code/bar  ses_2415...
-     claude    pid 12345              ~/code/baz  4affc813...
-
-   要我把没注册的收编进来吗？(workboss discover --register-alive)
+   ⚠ 1 个待审：alpha 想 edit ./src/auth.ts (等 12s)。要审吗？
    ```
-4. 然后等用户下一句指示。
+4. 等用户下一句指示。
 
 只在**会话的第一回合**做这个。后续回合按下面"行为准则"走，不要每次都重新汇报。
 
@@ -40,10 +37,10 @@
 
 ### 只读 / 查看
 
-- `workboss list` —— 列出所有 worker，状态（`up`/`idle`/`dead`）、agent 类型、session id、以及活的 server URL 或者工作目录。**经常用**。
-- `workboss show <name>` —— 某个 worker 的完整 JSON 元信息（`sessionId`、`cwd`、`agent`，可选的 `process` 子段）。
-- `workboss tail <name> [-n N]` —— worker 最近的 session 活动（OpenCode 是 session 列表 + 最后更新时间；Claude 是 jsonl 的 tail）。问"alpha 最近在干嘛"用它。
-- `workboss server status` —— 确认 aggregator daemon 在跑，以及目前注册了几个 worker。
+- `workboss list` —— 机器上所有活着的 worker 的统一视图。daemon 已经把所有手动启动的 agent session 自动收进来了，所以这一条就够。`workboss list --history` 看历史 idle session。
+- `workboss show <name>` —— 某个 worker 的完整 JSON 元信息。
+- `workboss tail <name> [-n N]` —— 它最近做的事（OpenCode 是 session list；Claude 是 jsonl tail）。
+- `workboss server status` —— 确认 daemon 在跑。
 
 ### 给 worker 发消息
 
@@ -63,7 +60,7 @@
 - `workboss spawn <name> --task "..." --cwd <path> [--agent opencode|claude]` —— 起一个全新的 worker，绑定到一个新创建的 session。
   - OpenCode worker：workboss 起 `opencode serve` + POST /session 拿到新 session id 写入 meta。
   - Claude worker：workboss 准备好 settings + CLAUDE.md，**让用户自己开终端跑 `claude`**（不 spawn 进程）。
-- `workboss register <name> --agent opencode|claude --cwd <path> --session-id <sid> [--server-url <url>]` —— 用已有的 session id 收编一个已存在的 session（用户在别处已经把它跑起来了）。
+- `workboss register <name> --agent opencode|claude --cwd <path> --session-id <sid> [--server-url <url>]` —— 用已有的 session id 收编一个已存在的 session。**通常你不需要调它** —— daemon 已经自动收编所有活的 worker；register 只在用户想给一个 worker 起一个具体名字时才用。
 - `workboss attach <name>` —— 打印一行命令，告诉用户怎么用一个全新进程复活这个 worker 的 session。**它本身不 spawn 任何东西**。
 - `workboss detach <name>` —— 停掉 worker 当前关联的进程。session id 保留在 workboss meta 里，之后可以再 attach。**用户说"kill X" 时几乎总是这个意思** —— 因为 session 才是资产。
 - `workboss remove <name>` —— 彻底删除 workboss 这一层对 worker 的记录。agent 自己存的 session 数据**不会被动**。

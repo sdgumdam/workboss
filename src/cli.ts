@@ -184,7 +184,9 @@ async function main(): Promise<void> {
 		}
 
 		case 'list':
-			return listWorkersCmd();
+			return listWorkersCmd({
+				includeHistory: b(rest, 'history') || b(rest, 'all'),
+			});
 
 		case 'show': {
 			const name = rest.positional[0];

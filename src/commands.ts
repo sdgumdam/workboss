@@ -330,22 +330,65 @@ function workerStatusLabel(w: WorkerMeta): string {
 	return isProcessAlive(w.process.pid) ? 'up   ' : 'dead ';
 }
 
-export async function listWorkersCmd(): Promise<void> {
-	const ws = await listWorkers();
-	if (ws.length === 0) {
-		ok('(no workers)');
+export interface ListOptions {
+	includeHistory?: boolean;
+}
+
+/**
+ * Show every worker on this machine in a single flat table.
+ *
+ * The daemon continuously sweeps the host and brings every live agent
+ * session into the workboss roster on its own, so by the time this command
+ * runs there is no meaningful "registered vs not" distinction left to
+ * surface. The user just sees workers.
+ *
+ * --history adds idle on-disk sessions (no live process) for archaeology.
+ */
+export async function listWorkersCmd(opts: ListOptions = {}): Promise<void> {
+	const workers = await listWorkers();
+	let history: DiscoveredSession[] = [];
+	if (opts.includeHistory) {
+		const known = {
+			sids: new Set(
+				workers.map(w => w.sessionId).filter((s): s is string => !!s),
+			),
+			urls: new Set(
+				workers
+					.map(w => w.process?.serverUrl)
+					.filter((u): u is string => !!u),
+			),
+			names: new Set<string>(),
+		};
+		history = partitionUnknown(await discoverAll(), known).history;
+	}
+
+	if (workers.length === 0 && history.length === 0) {
+		ok('(no workers on this machine)');
 		return;
 	}
-	for (const w of ws) {
+
+	for (const w of workers) {
 		const sid = shortSid(w.sessionId).padEnd(15);
 		const where = w.process?.serverUrl ?? w.cwd;
 		ok(
 			`${workerStatusLabel(w)}  ${w.name.padEnd(20)}  ${w.agent.padEnd(8)}  ${sid}  ${where}`,
 		);
 	}
+	if (opts.includeHistory) {
+		for (const d of history.slice(0, 50)) {
+			const title = d.title ? ` "${d.title.slice(0, 30)}"` : '';
+			ok(
+				`${fmtAge(d.lastActivity).padEnd(8)}  ${'(history)'.padEnd(20)}  ${d.agent.padEnd(8)}  ${shortSid(d.sessionId).padEnd(15)}  ${shortCwd(d.cwd, 35)}${title}`,
+			);
+		}
+		if (history.length > 50) {
+			ok(`... 还有 ${history.length - 50} 条`);
+		}
+	}
+
 	if (!(await readServerPort())) {
 		ok('');
-		ok('(workboss server is not running; approvals are not being captured)');
+		ok('(workboss server 没在跑；新 worker 不会被自动收编)');
 	}
 }
 
@@ -682,10 +725,12 @@ Workers — create new (spawns a fresh session):
 Workers — adopt an existing session:
   workboss register <name> --agent opencode|claude --cwd <path> \\
                             --session-id <sid> [--server-url <url>]
-  workboss discover [--all] [--register-alive]   # auto-find unregistered workers
+  workboss discover --register-alive             # auto-take-over every live worker
 
 Workers — inspection / interaction:
-  workboss list
+  workboss list                # ✓ managed, ● unmanaged-alive, ◌ history
+  workboss list --history      # include idle on-disk sessions
+  workboss list --managed-only # hide the unmanaged ones
   workboss show <name>
   workboss attach <name>            # prints the command to resume the session
   workboss message <name> "text"
