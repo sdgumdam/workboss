@@ -89,9 +89,22 @@ export interface AgentAdapter {
 	/**
 	 * Idempotently set up <cwd> so that any future agent session started in
 	 * it routes through workboss (mission/inbox docs, settings.local.json,
-	 * etc.). Called by `register` and `spawn` alike.
+	 * etc.). Called by `register` and `spawn` — i.e. when the user is
+	 * explicitly committing to this worker.
 	 */
 	prepareCwd(args: PrepareCwdArgs): Promise<void>;
+
+	/**
+	 * Lightest-possible setup for daemon auto-adoption: write only what is
+	 * strictly required to wire permission requests through workboss, and
+	 * skip anything that visibly modifies the user's working tree (e.g.
+	 * AGENTS.md / CLAUDE.md additions). Used when the daemon notices a
+	 * worker on its own and the user hasn't asked for it explicitly yet.
+	 *
+	 * `prepareCwd` remains the heavier path; it's invoked later on demand
+	 * (e.g. the first `workboss message`) to install the inbox protocol.
+	 */
+	prepareCwdMinimal(args: PrepareCwdArgs): Promise<void>;
 
 	/**
 	 * Lines `workboss attach <name>` should print to tell the user how to

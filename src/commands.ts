@@ -398,7 +398,7 @@ export async function showWorker(name: string): Promise<void> {
 }
 
 export async function messageWorker(name: string, text: string): Promise<void> {
-	await loadWorker(name);
+	const meta = await loadWorker(name);
 	const stamp = new Date().toISOString();
 	await fs.appendFile(
 		workerInboxPath(name),
@@ -406,6 +406,48 @@ export async function messageWorker(name: string, text: string): Promise<void> {
 		'utf8',
 	);
 	ok(`appended message to ${workerInboxPath(name)}`);
+
+	// If the worker's cwd doesn't yet have the workboss bootstrap doc, this
+	// message will sit in the inbox without ever being read — the agent
+	// doesn't know it's supposed to look. Lazy-install the doc now and tell
+	// the user how to make the change take effect.
+	const docName = meta.agent === 'claude' ? 'CLAUDE.md' : 'AGENTS.md';
+	const docPath = path.join(meta.cwd, docName);
+	const marker = `<!-- workboss:${name} -->`;
+	let hasMarker = false;
+	try {
+		hasMarker = (await fs.readFile(docPath, 'utf8')).includes(marker);
+	} catch {
+		/* file missing — also "no marker" */
+	}
+	if (hasMarker) return;
+
+	const workbossServerUrl = await ensureServerUp();
+	await getAdapter(meta.agent).prepareCwd({
+		workerName: name,
+		cwdAbs: meta.cwd,
+		workbossServerUrl,
+	});
+
+	ok('');
+	ok('⚠ 这是第一次给这个 worker 发消息。');
+	ok(`  inbox 协议引导已写入 ${docPath}。`);
+	ok(`  但 ${meta.agent === 'claude' ? 'Claude' : 'OpenCode'} session 启动后不会重读这个文件 ——`);
+	ok(`  当前对话窗的 worker 看不到这条消息。`);
+	ok('  要让它真正接进 workboss 的 inbox / 权限流，请重启 worker：');
+	if (meta.agent === 'claude') {
+		ok(
+			`    cd ${meta.cwd} && claude --resume ${meta.sessionId ?? '<session-id>'}`,
+		);
+	} else {
+		const url = meta.process?.serverUrl;
+		ok(`    在新终端: cd ${meta.cwd} && opencode serve --port <P>`);
+		ok(
+			`    然后:    opencode attach http://127.0.0.1:<P> --session ${meta.sessionId ?? '<session-id>'}`,
+		);
+		if (url) ok(`    (旧 server ${url} 可以关掉)`);
+	}
+	ok('  重启完之后这条 inbox 消息会在它的第一回合被读到。');
 }
 
 export async function tailWorker(name: string, n: number): Promise<void> {

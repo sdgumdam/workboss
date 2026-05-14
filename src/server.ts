@@ -349,13 +349,13 @@ async function adoptDiscoveredWorker(
 	const adapter = getAdapter(d.agent);
 
 	try {
-		await adapter.prepareCwd({
+		await adapter.prepareCwdMinimal({
 			workerName: name,
 			cwdAbs: d.cwd,
 			workbossServerUrl: workbossUrl,
 		});
 	} catch (err) {
-		log(`adopt ${name}: prepareCwd failed: ${String(err)}`);
+		log(`adopt ${name}: prepareCwdMinimal failed: ${String(err)}`);
 		return;
 	}
 

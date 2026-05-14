@@ -63,6 +63,20 @@ class ClaudeAdapter implements AgentAdapter {
 		await injectBootstrapDoc(args.cwdAbs, args.workerName, 'CLAUDE.md');
 	}
 
+	async prepareCwdMinimal(args: PrepareCwdArgs): Promise<void> {
+		// settings.local.json is required for the PreToolUse hook to point at
+		// workboss; without it we can't intercept permissions at all.
+		// CLAUDE.md (the inbox protocol primer) is intentionally NOT written
+		// here — we only add that file when the user actually starts using
+		// `workboss message` against this worker, to keep the working tree
+		// clean for cases where the user is happy just having permissions
+		// centralised.
+		await writeClaudeSettings(args.cwdAbs, {
+			workerName: args.workerName,
+			workbossServerUrl: args.workbossServerUrl,
+		});
+	}
+
 	async spawnNew(args: SpawnNewArgs): Promise<SpawnNewResult> {
 		await this.prepareCwd({
 			workerName: args.workerName,

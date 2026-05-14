@@ -93,6 +93,12 @@ class OpenCodeAdapter implements AgentAdapter {
 		await injectBootstrapDoc(args.cwdAbs, args.workerName, 'AGENTS.md');
 	}
 
+	async prepareCwdMinimal(_args: PrepareCwdArgs): Promise<void> {
+		// OpenCode hands us permission events over SSE on /event with no
+		// per-worker setup required — we just need the URL, which we already
+		// have from discovery. So this is a deliberate no-op.
+	}
+
 	async spawnNew(args: SpawnNewArgs): Promise<SpawnNewResult> {
 		await this.prepareCwd({
 			workerName: args.workerName,
