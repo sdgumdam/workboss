@@ -11,6 +11,7 @@ import {
 	registerWorker,
 	reject,
 	removeWorker,
+	serverRestart,
 	serverStart,
 	serverStatus,
 	serverStop,
@@ -85,10 +86,14 @@ async function main(): Promise<void> {
 			const sub = rest.positional[0];
 			if (sub === 'start') return serverStart();
 			if (sub === 'stop') return serverStop();
+			if (sub === 'restart') return serverRestart();
 			if (sub === 'status' || sub === undefined) return serverStatus();
 			console.error(`unknown server subcommand: ${sub}`);
 			process.exit(1);
 		}
+
+		case 'restart':
+			return serverRestart();
 
 		case 'boss':
 			return bossCmd({

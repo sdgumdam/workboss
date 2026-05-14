@@ -184,6 +184,23 @@ export async function serverStop(): Promise<void> {
 	ok(`sent SIGTERM to workboss server, pid=${pid}`);
 }
 
+/**
+ * Stop + start in one go. Useful while iterating on workboss itself
+ * (so the daemon loads freshly built dist/). End users rarely need
+ * this — auto-start covers most cases.
+ */
+export async function serverRestart(): Promise<void> {
+	await serverStop();
+	// Give SIGTERM a moment to land before the new daemon writes the same
+	// pid/port files.
+	const oldPid = await readServerPid();
+	const deadline = Date.now() + 3000;
+	while (oldPid && Date.now() < deadline && isProcessAlive(oldPid)) {
+		await new Promise(r => setTimeout(r, 100));
+	}
+	await serverStart();
+}
+
 export async function serverStatus(): Promise<void> {
 	const pid = await readServerPid();
 	const port = await readServerPort();
@@ -746,47 +763,36 @@ export async function bossCmd(args: {
 // ============================================================================
 
 export function printHelp(): void {
-	ok(`workboss — LLM-supervised worker fleet (opencode + claude code)
+	ok(`workboss — LLM-supervised worker fleet
 
-Workboss treats each worker as a *session pointer* (the durable LLM history
-on disk). Processes attached to a worker are transient — you can detach,
-kill, and resume by binding a new process to the same session id.
+You only need one command:
 
-Quick start (one command):
-  workboss boss [--agent opencode|claude]   # auto-start daemon + open orchestrator
+  workboss boss [--agent opencode|claude]
+      Auto-starts the daemon and drops you into an orchestrator
+      session. You talk to it in natural language. It runs all the
+      workboss commands below for you in the background.
 
-Server (auto-started by most commands; manage manually if needed):
-  workboss server start
-  workboss server stop
-  workboss server status
+Everything else is the orchestrator's tooling, not yours. You can
+peek if you want:
 
-Workers — create new (spawns a fresh session):
-  workboss spawn <name> --task "..." --cwd <path> [--agent opencode|claude]
-  workboss spawn <name> --mission <file> --cwd <path>
-
-Workers — adopt an existing session:
-  workboss register <name> --agent opencode|claude --cwd <path> \\
-                            --session-id <sid> [--server-url <url>]
-  workboss discover --register-alive             # auto-take-over every live worker
-
-Workers — inspection / interaction:
-  workboss list                # ✓ managed, ● unmanaged-alive, ◌ history
-  workboss list --history      # include idle on-disk sessions
-  workboss list --managed-only # hide the unmanaged ones
-  workboss show <name>
-  workboss attach <name>            # prints the command to resume the session
-  workboss message <name> "text"
-  workboss tail <name> [-n N]
-
-Workers — lifecycle:
-  workboss detach <name>            # kill current process, keep session
-  workboss remove <name>            # forget the worker (session on disk stays)
-
-Approvals (intended to be called by the orchestrator, not directly):
-  workboss approvals list
+  workboss list                            list all live workers
+  workboss list --history                  include idle on-disk sessions
+  workboss show <name>                     full meta for one worker
+  workboss tail <name> [-n N]              recent activity
+  workboss attach <name>                   print the command to enter its TUI
+  workboss message <name> "text"           append a note to its inbox
+  workboss approvals list                  pending permission requests
   workboss approve <id> [--always]
   workboss reject <id> --reason "..."
 
-Workboss root: ${WORKBOSS_ROOT}
+  workboss spawn <name> --task "..." --cwd <path> [--agent opencode|claude]
+  workboss register <name> --agent X --cwd Y --session-id Z [--server-url U]
+  workboss detach <name>                   stop the process, keep the session
+  workboss remove <name>                   forget the worker (session on disk stays)
+
+Daemon (auto-started; you usually never touch it):
+  workboss server start | stop | status | restart
+
+Workboss data: ${WORKBOSS_ROOT}
 `);
 }
