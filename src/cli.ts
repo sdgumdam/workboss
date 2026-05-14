@@ -3,6 +3,7 @@ import {
 	approvalsList,
 	attachWorker,
 	detachWorker,
+	discoverCmd,
 	listWorkersCmd,
 	messageWorker,
 	printHelp,
@@ -139,6 +140,13 @@ async function main(): Promise<void> {
 			}
 			return attachWorker(name);
 		}
+
+		case 'discover':
+			return discoverCmd({
+				all: b(rest, 'all'),
+				registerAlive: b(rest, 'register-alive'),
+				json: b(rest, 'json'),
+			});
 
 		case 'detach': {
 			const name = rest.positional[0];
