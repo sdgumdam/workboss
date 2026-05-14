@@ -2,6 +2,7 @@ import {
 	approve,
 	approvalsList,
 	attachWorker,
+	bossCmd,
 	detachWorker,
 	discoverCmd,
 	listWorkersCmd,
@@ -88,6 +89,11 @@ async function main(): Promise<void> {
 			console.error(`unknown server subcommand: ${sub}`);
 			process.exit(1);
 		}
+
+		case 'boss':
+			return bossCmd({
+				agent: (s(rest, 'agent') as 'opencode' | 'claude' | undefined),
+			});
 
 		case 'spawn': {
 			const name = rest.positional[0];

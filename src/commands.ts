@@ -1,5 +1,6 @@
 import {spawn} from 'child_process';
 import {promises as fs, existsSync} from 'fs';
+import os from 'os';
 import path from 'path';
 import {fileURLToPath} from 'url';
 import {
@@ -61,12 +62,12 @@ async function loadWorker(name: string): Promise<WorkerMeta> {
 
 async function ensureServerUp(): Promise<string> {
 	const port = await readServerPort();
-	if (port === null) {
-		fail(
-			'workboss server is not running. Start it first with `workboss server start`.',
-		);
-	}
-	return `http://127.0.0.1:${port}`;
+	if (port !== null) return `http://127.0.0.1:${port}`;
+	// Auto-start so the user doesn't have to remember `workboss server start`.
+	await serverStart();
+	const after = await readServerPort();
+	if (after === null) fail('failed to auto-start workboss server');
+	return `http://127.0.0.1:${after}`;
 }
 
 async function resolveMissionBody(args: {
@@ -577,6 +578,69 @@ export async function discoverCmd(opts: DiscoverOptions): Promise<void> {
 }
 
 // ============================================================================
+// boss — one-shot bootstrap of the orchestrator session
+// ============================================================================
+
+const ORCHESTRATOR_TEMPLATE = path.join(
+	__dirname,
+	'..',
+	'templates',
+	'ORCHESTRATOR.md',
+);
+
+const SUPERVISOR_HOME = path.join(os.homedir(), '.workboss', 'supervisor');
+
+/**
+ * Start the workboss daemon (if it isn't already), refresh the orchestrator
+ * prompt in a dedicated supervisor cwd, and exec the chosen agent there
+ * with stdio inherited so the user is dropped straight into the conversation.
+ *
+ * Equivalent to:
+ *   workboss server start              # auto-started
+ *   mkdir -p ~/.workboss/supervisor
+ *   cp templates/ORCHESTRATOR.md ~/.workboss/supervisor/AGENTS.md
+ *   cd ~/.workboss/supervisor && opencode
+ */
+export async function bossCmd(args: {
+	agent?: 'opencode' | 'claude';
+}): Promise<void> {
+	await ensureServerUp();
+
+	await fs.mkdir(SUPERVISOR_HOME, {recursive: true, mode: 0o700});
+	const agent = args.agent ?? 'opencode';
+	const docName = agent === 'claude' ? 'CLAUDE.md' : 'AGENTS.md';
+	const promptContent = await fs.readFile(ORCHESTRATOR_TEMPLATE, 'utf8');
+	await fs.writeFile(
+		path.join(SUPERVISOR_HOME, docName),
+		promptContent,
+		'utf8',
+	);
+
+	ok(`workboss boss: launching ${agent} in ${SUPERVISOR_HOME}`);
+	ok('');
+
+	const child = spawn(agent, [], {
+		cwd: SUPERVISOR_HOME,
+		stdio: 'inherit',
+	});
+
+	await new Promise<void>((resolve, reject) => {
+		child.on('exit', code => {
+			process.exitCode = code ?? 0;
+			resolve();
+		});
+		child.on('error', err => {
+			reject(
+				new Error(
+					`failed to launch ${agent}: ${err.message}. ` +
+						`Is "${agent}" on your PATH?`,
+				),
+			);
+		});
+	});
+}
+
+// ============================================================================
 // help
 // ============================================================================
 
@@ -587,7 +651,10 @@ Workboss treats each worker as a *session pointer* (the durable LLM history
 on disk). Processes attached to a worker are transient — you can detach,
 kill, and resume by binding a new process to the same session id.
 
-Server (the aggregator daemon that captures approvals and routes replies):
+Quick start (one command):
+  workboss boss [--agent opencode|claude]   # auto-start daemon + open orchestrator
+
+Server (auto-started by most commands; manage manually if needed):
   workboss server start
   workboss server stop
   workboss server status
