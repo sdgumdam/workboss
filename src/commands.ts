@@ -619,7 +619,23 @@ export async function bossCmd(args: {
 	ok(`workboss boss: launching ${agent} in ${SUPERVISOR_HOME}`);
 	ok('');
 
-	const child = spawn(agent, [], {
+	// Inject an initial user message so the orchestrator scans the machine
+	// (registered + unregistered) the moment it boots, without the user
+	// needing to type anything first. Only opencode supports a `--prompt`
+	// flag with interactive TUI; for claude the inline mode is non-interactive
+	// so we fall back to "type 'scan' once you're in".
+	const bootScan =
+		'立即扫一遍机器：调用 workboss list 看已注册 worker，调用 workboss discover 看机器上还有哪些活的 / 历史 session 没注册，把两边合并成一段紧凑的开机汇总给我看。然后等我下一步指令。';
+	const cliArgs =
+		agent === 'opencode' ? ['--prompt', bootScan] : [];
+	if (agent === 'claude') {
+		ok(
+			'(提示：claude 启动后第一句对它说"扫一遍"它就会自动跑 list+discover 汇报)',
+		);
+		ok('');
+	}
+
+	const child = spawn(agent, cliArgs, {
 		cwd: SUPERVISOR_HOME,
 		stdio: 'inherit',
 	});
