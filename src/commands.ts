@@ -727,7 +727,7 @@ export async function bossCmd(args: {
 	// flag with interactive TUI; for claude the inline mode is non-interactive
 	// so we fall back to "type 'scan' once you're in".
 	const bootScan =
-		'立即扫一遍机器：调用 workboss list 看已注册 worker，调用 workboss discover 看机器上还有哪些活的 / 历史 session 没注册，把两边合并成一段紧凑的开机汇总给我看。然后等我下一步指令。';
+		'按 AGENTS.md 的"开机自检"段做一次：把机器上所有活着的 worker 和当前待审批用一段话扫完的格式汇报给我。然后等我下一步指令。';
 	const cliArgs =
 		agent === 'opencode' ? ['--prompt', bootScan] : [];
 	if (agent === 'claude') {
