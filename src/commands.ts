@@ -456,13 +456,21 @@ export async function messageWorker(name: string, text: string): Promise<void> {
 		ok(
 			`    cd ${meta.cwd} && claude --resume ${meta.sessionId ?? '<session-id>'}`,
 		);
-	} else {
-		const url = meta.process?.serverUrl;
+	} else if (meta.process?.serverUrl) {
+		// OpenCode workboss-spawned (server + attach mode).
 		ok(`    在新终端: cd ${meta.cwd} && opencode serve --port <P>`);
 		ok(
 			`    然后:    opencode attach http://127.0.0.1:<P> --session ${meta.sessionId ?? '<session-id>'}`,
 		);
-		if (url) ok(`    (旧 server ${url} 可以关掉)`);
+		ok(`    (旧 server ${meta.process.serverUrl} 可以关掉)`);
+	} else {
+		// OpenCode TUI mode (user-launched; no HTTP server).
+		ok(
+			`    退出当前 opencode (Ctrl+D 或 /quit)，然后重启它：`,
+		);
+		ok(
+			`    cd ${meta.cwd} && opencode --session ${meta.sessionId ?? '<session-id>'}`,
+		);
 	}
 	ok('  重启完之后这条 inbox 消息会在它的第一回合被读到。');
 }

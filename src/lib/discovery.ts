@@ -41,6 +41,51 @@ const UUID_RE =
 
 // ---------- live processes ----------
 
+/**
+ * Recover the session id of a running `claude` process whose command line
+ * does not carry `--resume <uuid>`. Claude writes the live conversation
+ * jsonl in real time, so the most-recently-modified jsonl inside the
+ * process's cwd-encoded project directory is almost always the session it
+ * is actively writing to.
+ *
+ * Claude collapses `/`, `_`, and `.` to `-` in the directory name; the
+ * leading `/` of an absolute path becomes a leading `-`. We accept a
+ * generous staleness window (24h) so an idle but still-attached session is
+ * picked up.
+ */
+async function findCurrentClaudeSessionId(
+	cwd: string,
+): Promise<string | undefined> {
+	const encoded = cwd.replace(/[/_.]/g, '-');
+	const dir = path.join(
+		process.env['CLAUDE_CONFIG_DIR'] ?? path.join(os.homedir(), '.claude'),
+		'projects',
+		encoded,
+	);
+	let entries: string[];
+	try {
+		entries = await fs.readdir(dir);
+	} catch {
+		return undefined;
+	}
+	let best: {sid: string; mtimeMs: number} | null = null;
+	for (const f of entries) {
+		if (!f.endsWith('.jsonl')) continue;
+		try {
+			const st = await fs.stat(path.join(dir, f));
+			if (!best || st.mtimeMs > best.mtimeMs) {
+				best = {sid: f.slice(0, -'.jsonl'.length), mtimeMs: st.mtimeMs};
+			}
+		} catch {
+			/* skip */
+		}
+	}
+	if (!best) return undefined;
+	const STALE_MS = 24 * 60 * 60 * 1000;
+	if (Date.now() - best.mtimeMs > STALE_MS) return undefined;
+	return best.sid;
+}
+
 async function lsofCwd(pid: number): Promise<string | undefined> {
 	try {
 		const {stdout} = await execFileAsync('lsof', [
@@ -77,13 +122,53 @@ async function fetchOpencodeLatestSession(
 }
 
 /**
+ * For an `opencode` TUI process (no HTTP API exposed): recover the session
+ * id it is most likely working on by asking the opencode sqlite database
+ * for the most-recently-updated session that lives in this cwd.
+ *
+ * Mirrors the claude-jsonl-mtime trick: OpenCode persists session state in
+ * sqlite as the user talks to the TUI, so the highest time_updated in this
+ * cwd is the live session.
+ */
+async function findOpencodeSessionForCwd(
+	cwd: string,
+): Promise<string | undefined> {
+	const db = path.join(
+		os.homedir(),
+		'.local',
+		'share',
+		'opencode',
+		'opencode.db',
+	);
+	try {
+		await fs.access(db);
+	} catch {
+		return undefined;
+	}
+	const sql =
+		`SELECT id FROM session WHERE directory = '${cwd.replace(/'/g, "''")}' ` +
+		`AND time_archived IS NULL ORDER BY time_updated DESC LIMIT 1;`;
+	try {
+		const {stdout} = await execFileAsync(
+			'sqlite3',
+			['-readonly', db, sql],
+			{maxBuffer: 1024 * 1024},
+		);
+		const id = stdout.trim();
+		return id || undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
  * Parse one `ps -eo pid=,args=` line for opencode/claude invocations.
  * Returns null when the line is not interesting.
  */
 function classifyPsLine(line: string): {
 	pid: number;
 	hit:
-		| {agent: 'opencode'; port: number}
+		| {agent: 'opencode'; port?: number; sessionId?: string; isAttachClient?: boolean}
 		| {agent: 'claude'; sessionId?: string};
 } | null {
 	const trimmed = line.trimStart();
@@ -94,15 +179,38 @@ function classifyPsLine(line: string): {
 	if (!Number.isFinite(pid)) return null;
 	const args = trimmed.slice(spaceAt + 1);
 
-	// opencode serve --port <P>
-	const oc = args.match(/\bopencode\s+serve\b[^|]*?--port\s+(\d+)/);
-	if (oc) {
-		return {pid, hit: {agent: 'opencode', port: Number.parseInt(oc[1]!, 10)}};
+	// 1. opencode serve --port <P>: full HTTP-backed worker.
+	const serve = args.match(/\bopencode\s+serve\b[^|]*?--port\s+(\d+)/);
+	if (serve) {
+		return {pid, hit: {agent: 'opencode', port: Number.parseInt(serve[1]!, 10)}};
 	}
 
-	// claude  (with or without --resume <uuid>)
-	// We require the word "claude" to be either the basename or appear after
-	// a path separator, to reduce false positives like "/usr/bin/foo --claude"
+	// 2. opencode attach <url>: this is a *client* of another server, not a
+	// worker. Skip — the server it's attached to will show up on its own (or
+	// is the workboss-spawned one we already know).
+	if (/\bopencode\s+attach\b/.test(args)) {
+		return {pid, hit: {agent: 'opencode', isAttachClient: true}};
+	}
+
+	// 3. opencode --session ses_xxx / opencode -s ses_xxx (TUI mode with
+	// explicit session). No HTTP API but sid is right in the cmdline.
+	const sessionFlag = args.match(/\bopencode\b[^|]*?(?:--session|\s-s)\s+(ses_\S+)/);
+	if (sessionFlag) {
+		return {pid, hit: {agent: 'opencode', sessionId: sessionFlag[1]}};
+	}
+
+	// 4. Bare `opencode` (or `opencode <project>`): TUI mode, no API, no
+	// explicit sid in cmdline. We'll recover sid by querying the sqlite db
+	// at lookup time using cwd.
+	if (/(?:^|\s|\/)opencode(?:\s|$)/.test(args) && !args.includes(' --')) {
+		return {pid, hit: {agent: 'opencode'}};
+	}
+	// Also catch `opencode <project>` where <project> is positional.
+	if (/^(?:\S+\/)?opencode\s/.test(args.trimStart())) {
+		return {pid, hit: {agent: 'opencode'}};
+	}
+
+	// 5. claude  (with or without --resume <uuid>)
 	const claudeBin = /(?:^|\s|\/)claude(?:\s|$)/.test(args);
 	if (claudeBin) {
 		const resume = args.match(/--resume\s+(\S+)/);
@@ -125,33 +233,60 @@ export async function findAliveAgents(): Promise<DiscoveredSession[]> {
 	}
 
 	const out: DiscoveredSession[] = [];
+	const seen = new Set<string>();
 	for (const line of stdout.split('\n')) {
 		const c = classifyPsLine(line);
 		if (!c) continue;
+		const cwd = await lsofCwd(c.pid);
+
 		if (c.hit.agent === 'opencode') {
-			const serverUrl = `http://127.0.0.1:${c.hit.port}`;
-			const [cwd, sid] = await Promise.all([
-				lsofCwd(c.pid),
-				fetchOpencodeLatestSession(serverUrl),
-			]);
+			// Attach clients aren't workers themselves; the server they're
+			// pointing at is. Skip — workboss either knows about that server
+			// or it'll be picked up via its own process row.
+			if (c.hit.isAttachClient) continue;
+
+			let serverUrl: string | undefined;
+			let sessionId: string | undefined = c.hit.sessionId;
+
+			if (c.hit.port !== undefined) {
+				serverUrl = `http://127.0.0.1:${c.hit.port}`;
+				if (!sessionId) {
+					sessionId = await fetchOpencodeLatestSession(serverUrl);
+				}
+			} else if (!sessionId && cwd) {
+				// TUI mode, no HTTP, no cmdline sid → ask the sqlite db.
+				sessionId = await findOpencodeSessionForCwd(cwd);
+			}
+
+			const key = sessionId ? `opencode:${sessionId}` : `pid:${c.pid}`;
+			if (seen.has(key)) continue;
+			seen.add(key);
 			out.push({
 				agent: 'opencode',
 				pid: c.pid,
 				cwd,
 				serverUrl,
-				sessionId: sid,
+				sessionId,
 				alive: true,
 			});
-		} else {
-			const cwd = await lsofCwd(c.pid);
-			out.push({
-				agent: 'claude',
-				pid: c.pid,
-				cwd,
-				sessionId: c.hit.sessionId,
-				alive: true,
-			});
+			continue;
 		}
+
+		// claude
+		let sessionId = c.hit.sessionId;
+		if (!sessionId && cwd) {
+			sessionId = await findCurrentClaudeSessionId(cwd);
+		}
+		const key = sessionId ? `claude:${sessionId}` : `pid:${c.pid}`;
+		if (seen.has(key)) continue;
+		seen.add(key);
+		out.push({
+			agent: 'claude',
+			pid: c.pid,
+			cwd,
+			sessionId,
+			alive: true,
+		});
 	}
 	return out;
 }
