@@ -1,23 +1,20 @@
 /**
- * Tiny JSON-over-TCP/Unix-socket protocol the workboss CLI uses to talk to
- * the long-running aggregator daemon. The daemon owns the SSE subscriptions
- * to every worker; CLI invocations just ask it to list, approve, or reject.
- *
- * We avoid a full HTTP framework — the surface is tiny and a single line of
- * NDJSON request -> NDJSON response is enough.
- *
- * Wire format:
- *   client -> server: one JSON object terminated by "\n"
- *   server -> client: one JSON object terminated by "\n"
+ * RPC client used by the workboss CLI to talk to the running aggregator
+ * daemon. The daemon exposes an HTTP server on a random local port; we POST
+ * a JSON request to /rpc and parse the JSON response.
  */
 
-import net from 'net';
 import {readServerPort} from './storage.js';
 
 export type RpcRequest =
 	| {kind: 'ping'}
 	| {kind: 'approvals.list'}
-	| {kind: 'approvals.reply'; id: string; reply: 'once' | 'always' | 'reject'; message?: string}
+	| {
+			kind: 'approvals.reply';
+			id: string;
+			reply: 'once' | 'always' | 'reject';
+			message?: string;
+	  }
 	| {kind: 'workers.attach'; name: string}
 	| {kind: 'workers.detach'; name: string};
 
@@ -30,33 +27,22 @@ export async function rpcCall(req: RpcRequest): Promise<RpcResponse> {
 	if (port === null) {
 		return {
 			ok: false,
-			error: 'workboss server is not running. Start it with `workboss server start`.',
+			error:
+				'workboss server is not running. Start it with `workboss server start`.',
 		};
 	}
-	return new Promise(resolve => {
-		const sock = net.createConnection({host: '127.0.0.1', port}, () => {
-			sock.write(JSON.stringify(req) + '\n');
+	try {
+		const res = await fetch(`http://127.0.0.1:${port}/rpc`, {
+			method: 'POST',
+			headers: {'content-type': 'application/json'},
+			body: JSON.stringify(req),
 		});
-		let buf = '';
-		sock.setEncoding('utf8');
-		sock.on('data', chunk => {
-			buf += chunk;
-			const nl = buf.indexOf('\n');
-			if (nl !== -1) {
-				try {
-					const res = JSON.parse(buf.slice(0, nl)) as RpcResponse;
-					resolve(res);
-				} catch (err) {
-					resolve({ok: false, error: `bad response: ${String(err)}`});
-				}
-				sock.end();
-			}
-		});
-		sock.on('error', err => {
-			resolve({
-				ok: false,
-				error: `cannot reach workboss server on ${port}: ${err.message}`,
-			});
-		});
-	});
+		const data = (await res.json()) as RpcResponse;
+		return data;
+	} catch (err) {
+		return {
+			ok: false,
+			error: `cannot reach workboss server on ${port}: ${err instanceof Error ? err.message : String(err)}`,
+		};
+	}
 }

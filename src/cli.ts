@@ -1,12 +1,14 @@
 import {
-	adoptWorker,
 	approve,
 	approvalsList,
-	killWorker,
+	attachWorker,
+	detachWorker,
 	listWorkersCmd,
 	messageWorker,
 	printHelp,
+	registerWorker,
 	reject,
+	removeWorker,
 	serverStart,
 	serverStatus,
 	serverStop,
@@ -63,7 +65,12 @@ function b(p: ParsedArgs, k: string): boolean {
 
 async function main(): Promise<void> {
 	const args = process.argv.slice(2);
-	if (args.length === 0 || args[0] === 'help' || args[0] === '--help' || args[0] === '-h') {
+	if (
+		args.length === 0 ||
+		args[0] === 'help' ||
+		args[0] === '--help' ||
+		args[0] === '-h'
+	) {
 		printHelp();
 		return;
 	}
@@ -84,7 +91,9 @@ async function main(): Promise<void> {
 		case 'spawn': {
 			const name = rest.positional[0];
 			if (!name) {
-				console.error('usage: workboss spawn <name> --task "..." --cwd <path>');
+				console.error(
+					'usage: workboss spawn <name> --task "..." --cwd <path> [--agent opencode|claude]',
+				);
 				process.exit(1);
 			}
 			const cwd = s(rest, 'cwd');
@@ -102,14 +111,62 @@ async function main(): Promise<void> {
 			});
 		}
 
-		case 'adopt': {
+		case 'register': {
 			const name = rest.positional[0];
-			const url = s(rest, 'url');
-			if (!name || !url) {
-				console.error('usage: workboss adopt <name> --url http://localhost:<port> [--cwd <path>]');
+			const agent = s(rest, 'agent') as AgentKind | undefined;
+			const cwd = s(rest, 'cwd');
+			const sessionId = s(rest, 'session-id') ?? s(rest, 'session');
+			if (!name || !agent || !cwd || !sessionId) {
+				console.error(
+					'usage: workboss register <name> --agent opencode|claude --cwd <path> --session-id <sid> [--server-url <url>]',
+				);
 				process.exit(1);
 			}
-			return adoptWorker({name, url, cwd: s(rest, 'cwd')});
+			return registerWorker({
+				name,
+				agent,
+				cwd,
+				sessionId,
+				serverUrl: s(rest, 'server-url'),
+			});
+		}
+
+		case 'attach': {
+			const name = rest.positional[0];
+			if (!name) {
+				console.error('usage: workboss attach <name>');
+				process.exit(1);
+			}
+			return attachWorker(name);
+		}
+
+		case 'detach': {
+			const name = rest.positional[0];
+			if (!name) {
+				console.error('usage: workboss detach <name>');
+				process.exit(1);
+			}
+			return detachWorker(name);
+		}
+
+		case 'remove':
+		case 'rm': {
+			const name = rest.positional[0];
+			if (!name) {
+				console.error('usage: workboss remove <name>');
+				process.exit(1);
+			}
+			return removeWorker(name);
+		}
+
+		case 'kill': {
+			// alias kept for muscle memory; semantically the same as detach
+			const name = rest.positional[0];
+			if (!name) {
+				console.error('usage: workboss detach <name>');
+				process.exit(1);
+			}
+			return detachWorker(name);
 		}
 
 		case 'list':
@@ -142,15 +199,6 @@ async function main(): Promise<void> {
 			}
 			const n = s(rest, 'n') ?? '20';
 			return tailWorker(name, parseInt(n, 10));
-		}
-
-		case 'kill': {
-			const name = rest.positional[0];
-			if (!name) {
-				console.error('usage: workboss kill <name>');
-				process.exit(1);
-			}
-			return killWorker(name);
 		}
 
 		case 'approvals': {

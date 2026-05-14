@@ -51,6 +51,26 @@ export async function writeWorkerMeta(meta: WorkerMeta): Promise<void> {
 	);
 }
 
+/**
+ * Read-modify-write a worker's meta atomically with respect to other
+ * workboss processes accessing the same file. We only run inside a single
+ * Node process here so the simple read-then-write is good enough.
+ */
+export async function updateWorkerMeta(
+	name: string,
+	patch: (meta: WorkerMeta) => WorkerMeta | Promise<WorkerMeta>,
+): Promise<WorkerMeta | null> {
+	let meta: WorkerMeta;
+	try {
+		meta = await readWorkerMeta(name);
+	} catch {
+		return null;
+	}
+	const next = await patch(meta);
+	await writeWorkerMeta(next);
+	return next;
+}
+
 export async function deleteWorker(name: string): Promise<void> {
 	const dir = workerDir(name);
 	if (!existsSync(dir)) return;

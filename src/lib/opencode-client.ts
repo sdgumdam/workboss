@@ -43,6 +43,32 @@ function authHeader(opts: OpenCodeClientOptions): Record<string, string> {
 	return {Authorization: `Basic ${tok}`};
 }
 
+/**
+ * Create a fresh session on the worker's opencode server. Returns the
+ * sessionId that future commands ("opencode attach --session ...") can
+ * resume from. Optional title shows up in `opencode session list`.
+ */
+export async function createSession(
+	opts: OpenCodeClientOptions,
+	title?: string,
+): Promise<string> {
+	const body = title ? JSON.stringify({title}) : '{}';
+	const res = await fetch(`${opts.baseUrl}/session`, {
+		method: 'POST',
+		headers: {'content-type': 'application/json', ...authHeader(opts)},
+		body,
+	});
+	if (!res.ok) {
+		throw new Error(
+			`opencode /session create failed: ${res.status} ${res.statusText}`,
+		);
+	}
+	const data = (await res.json()) as {id?: string; sessionID?: string};
+	const id = data.id ?? data.sessionID;
+	if (!id) throw new Error('opencode /session response missing id');
+	return id;
+}
+
 export async function listPermissions(
 	opts: OpenCodeClientOptions,
 ): Promise<OpenCodePermissionRequest[]> {

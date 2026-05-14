@@ -1,9 +1,10 @@
 # workboss
 
-An LLM-supervised manager for a fleet of long-lived OpenCode coding agent sessions.
+An LLM-supervised manager for a fleet of long-lived coding agent **sessions**,
+across both **OpenCode** and **Claude Code**.
 
-You talk to **one** orchestrator (an OpenCode session pre-loaded with the
-workboss role). It can:
+You talk to **one** orchestrator (an OpenCode or Claude Code session pre-loaded
+with the workboss role). It can:
 
 - **Patrol** the fleet: list workers, summarise what each is doing, flag the
   stuck or idle ones.
@@ -12,39 +13,66 @@ workboss role). It can:
   window, not by tab-switching to each worker's TUI.
 - **Nudge** workers via natural language: it writes to each worker's inbox so
   the worker picks it up at the start of its next turn.
-- **Spawn** new workers on tasks, or **adopt** OpenCode servers you already
-  started by hand.
+- **Spawn** new workers on tasks, **register** sessions you already started by
+  hand, **detach** processes without losing state, and **attach** later by
+  resuming the same session id.
 
-You can still attach to any worker directly with `opencode attach <url>` when
-you want to drive it yourself — the orchestrator is convenience, not control.
+You can still join any worker directly (`opencode attach …` or `claude --resume
+…`) when you want to drive it yourself — the orchestrator is convenience, not
+control.
+
+## Core idea: the session is the asset
+
+A workboss worker is fundamentally a *pointer to an agent session* — the jsonl
+file on disk for Claude Code, or the sqlite row for OpenCode. **That history is
+the durable artifact.** The process running on top of it is replaceable: you
+can kill it, the laptop can crash, you can switch machines — as long as you
+remember the session id, a new process can be bound to it and pick up where it
+left off.
+
+This shapes the tool:
+
+- `workboss spawn` creates a session and remembers its id.
+- `workboss register` adopts an existing session by id (no spawn needed).
+- `workboss detach` kills the current process; the session is preserved.
+- `workboss attach <name>` prints the exact command to resume the session in a
+  new process.
+- `workboss remove` forgets the workboss-level entry; the underlying session
+  data is untouched.
+
+Because both Claude Code and OpenCode store sessions on disk and support
+resume, the two agent backends share the same lifecycle and the same UX.
 
 ## Architecture
 
 ```
-┌─ orchestrator (one OpenCode session, role = workboss) ──────────┐
-│   you talk to this. it runs `workboss …` for you.               │
-└─────────────────────────┬───────────────────────────────────────┘
-                          │  CLI / Unix-style commands
-                          ▼
-┌─ workboss CLI ──────────────────────────────────────────────────┐
-│   spawn / adopt / list / message / tail / kill                  │
-│   approvals list / approve / reject                             │
-└─────────────────────────┬───────────────────────────────────────┘
-                          │  JSON-over-TCP RPC (127.0.0.1)
-                          ▼
-┌─ workboss server (daemon) ──────────────────────────────────────┐
-│   subscribes to every worker's /event SSE stream                │
-│   permission.asked → queue file in ~/.workboss/approvals/       │
-│   reply → POST to worker's /permission/:id/reply                │
-│   enforces hard-deny patterns regardless of caller              │
-└─────────────────────────┬───────────────────────────────────────┘
-                          │  HTTP + SSE
-                          ▼
-┌─ workers (each one is `opencode serve` in its own cwd) ─────────┐
-│   own port, own DB, own session history                         │
-│   permissions ruleset injected via OPENCODE_CONFIG              │
-│   workboss adds AGENTS.md so the agent reads its inbox.md       │
-└─────────────────────────────────────────────────────────────────┘
+┌─ orchestrator (one OpenCode / Claude Code session, role = workboss) ─┐
+│   you talk to this in natural language; it runs `workboss …` for you │
+└────────────────────────────┬─────────────────────────────────────────┘
+                             │
+                             ▼
+┌─ workboss CLI ───────────────────────────────────────────────────────┐
+│   spawn / register / attach / detach / remove                        │
+│   list / show / message / tail                                       │
+│   approvals list / approve / reject                                  │
+└────────────────────────────┬─────────────────────────────────────────┘
+                             │  HTTP /rpc on 127.0.0.1
+                             ▼
+┌─ workboss server (daemon) ───────────────────────────────────────────┐
+│   For OpenCode workers: subscribes to /event SSE                     │
+│   For Claude workers:   exposes POST /claude-hook/:worker            │
+│                         (Claude's PreToolUse HTTP hook target)       │
+│   permission.asked → ~/.workboss/approvals/<id>.json                 │
+│   approve / reject → forwarded back to the worker                    │
+│   enforces hard-deny regex regardless of caller                      │
+└────────────────────────────┬─────────────────────────────────────────┘
+                             │
+                             ▼
+┌─ workers (each one is one agent session bound to one cwd) ───────────┐
+│   OpenCode: `opencode serve` in cwd → session in opencode.db         │
+│   Claude:   `claude` (or `claude --resume <sid>`) in cwd             │
+│                 with .claude/settings.local.json from workboss       │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Install (local dev)
@@ -53,75 +81,60 @@ you want to drive it yourself — the orchestrator is convenience, not control.
 cd workboss
 npm install
 npm run build
-# Use directly:
-node bin/workboss.js help
-# Or alias it:
 alias workboss="node $(pwd)/bin/workboss.js"
 ```
 
-Requires Node ≥ 22, `opencode` on `PATH` (workboss spawns `opencode serve`).
+Requires Node ≥ 22, `opencode` on `PATH` for opencode workers, `claude` on
+`PATH` for claude workers.
 
 ## Quickstart
 
 ```bash
-# 1. Start the supervisor daemon (background; logs at ~/.workboss/server.log)
+# 1. Start the supervisor daemon
 workboss server start
 
-# 2. Spawn a worker on a task. The worker is just `opencode serve` in --cwd
-#    with workboss policies and an AGENTS.md primer.
+# 2A. Create an opencode worker (workboss spawns the server + a session)
 workboss spawn alpha \
   --task "Read this codebase and propose a refactor for the session module" \
-  --cwd ~/code/myrepo
+  --cwd ~/code/myrepo \
+  --agent opencode
 
-# 3. Workboss prints something like:
-#    serve : http://127.0.0.1:54321
-#    Attach a TUI client to start working with it:
-#      opencode attach http://127.0.0.1:54321
-#
-#    Open that in another terminal to talk to the worker.
+# 2B. Create a claude worker (workboss prepares files; you start claude yourself)
+workboss spawn beta \
+  --task "Investigate a flaky test in tests/api" \
+  --cwd ~/code/myrepo \
+  --agent claude
 
-# 4. Talk to the orchestrator (a separate OpenCode session, see "Orchestrator"
-#    below). Say things like:
-#       "巡视一下"
+# 3. Workboss prints how to join the worker:
+#    opencode → opencode attach http://127.0.0.1:<P> --session ses_...
+#    claude   → cd ~/code/myrepo && claude
+
+# 4. In another terminal, run the orchestrator (any agent of your choice).
+#    Tell it things like:
+#       "patrol"
 #       "approve alpha's request"
-#       "nudge alpha to also check the tests"
-#
-#    The orchestrator runs `workboss …` under the hood and synthesises the
-#    output for you.
+#       "nudge beta to also check the logs"
+#       "kill alpha but keep the session"
 ```
-
-## Orchestrator
-
-`templates/ORCHESTRATOR.md` is the system prompt to feed into a dedicated
-OpenCode session that supervises everything else. Recommended setup:
-
-```bash
-# Make a tiny "supervisor" workspace
-mkdir -p ~/workboss-supervisor
-cp templates/ORCHESTRATOR.md ~/workboss-supervisor/AGENTS.md
-
-# Run OpenCode there. AGENTS.md is auto-loaded by opencode.
-cd ~/workboss-supervisor
-opencode
-```
-
-Then talk to that OpenCode session in natural language. It will call workboss
-commands as needed.
 
 ## Permission model
 
-Every worker gets a permission ruleset (`OPENCODE_CONFIG`) at spawn time:
+Every worker gets a permission ruleset at registration time, picked up by the
+agent on its own. The categories are deliberately the same across both
+agents:
 
-- **`read`** auto-allow
-- **`webfetch`** auto-allow
-- **`edit`** asks the supervisor
-- **`bash`**: a curated allow list for read-only / test-runner commands, a
-  curated deny list for irreversible operations, everything else asks the
-  supervisor
+- `read` auto-allow
+- `webfetch` auto-allow
+- `edit` asks the supervisor
+- `bash`: a curated allow-list for read-only / test-runner commands, a curated
+  deny-list for irreversible operations, everything else asks the supervisor
 
-When OpenCode `asks`, the request flows up through SSE to the workboss server,
-into the approvals queue, and out to the orchestrator (or you, via
-`workboss approvals list / approve / reject`).
+When the worker hits "ask", the request flows into the workboss approvals
+queue. The orchestrator (or you) decides:
+
+- **once** — allow this single request
+- **always** — allow + persist the pattern so similar requests auto-pass
+- **reject** — block (with an optional reason fed back to the LLM)
 
 ### Hard deny
 
@@ -130,27 +143,38 @@ even if the caller (you or the orchestrator) tries to approve them:
 
 - `rm -rf …`, `sudo …`
 - `git push --force` / `-f`, `git reset --hard`, `git checkout -- …`
-- `curl … | sh` / `wget … | bash` (remote-payload-into-shell)
+- `curl … | sh` / `wget … | bash`
 
-You can edit a worker's `~/.workboss/workers/<name>/opencode.json` to loosen
-its allow list, but the workboss server runs these regex checks server-side
-before forwarding any reply — so changing the worker's local config can't
-defeat them. To bypass, the user has to perform the action outside workboss.
+These are checked **server-side** in workboss before any reply is forwarded.
+You can edit a worker's settings to loosen its allow-list, but you cannot
+bypass these regexes by relaxing the worker's own config — the daemon enforces
+them on every approve attempt.
 
 ## CLI reference
 
 ```
 workboss server start | stop | status
 
-workboss spawn <name> --task "..." --cwd <path> [--port <P>]
+# Create a new worker (spawns or sets up a fresh session)
+workboss spawn <name> --task "..." --cwd <path> [--agent opencode|claude]
 workboss spawn <name> --mission <file> --cwd <path>
-workboss adopt <name> --url http://localhost:<port> [--cwd <path>]
+
+# Adopt an existing session you already created elsewhere
+workboss register <name> --agent opencode|claude --cwd <path> \
+                         --session-id <sid> [--server-url <url>]
+
+# Operate on a worker
 workboss list
 workboss show <name>
+workboss attach <name>            # prints the command to resume in a new process
 workboss message <name> "text"
 workboss tail <name> [-n N]
-workboss kill <name>
 
+# Lifecycle
+workboss detach <name>            # stop the current process, keep the session
+workboss remove <name>            # forget the worker entry (session on disk stays)
+
+# Approvals (called by the orchestrator)
 workboss approvals list
 workboss approve <id> [--always]
 workboss reject <id> --reason "..."
@@ -161,22 +185,38 @@ workboss reject <id> --reason "..."
 ```
 ~/.workboss/
   server.pid                 PID of the running aggregator
-  server.port                127.0.0.1 port the RPC listens on
+  server.port                127.0.0.1 port the HTTP listener is on
   server.log                 aggregator stdout
   workers/<name>/
-    meta.json                agent type, cwd, server URL, pid
-    opencode.json            OPENCODE_CONFIG injected at spawn
-    mission.md               task brief (user-authored)
+    meta.json                identity (name, agent, cwd, sessionId) + optional process info
+    opencode.json            OPENCODE_CONFIG (opencode workers only)
+    mission.md               task brief
     inbox.md                 coordinator notes the worker reads each turn
-    serve.log                stdout/stderr of `opencode serve`
+    serve.log                stdout/stderr of `opencode serve` (opencode workers only)
   approvals/
-    <permission-id>.json     pending approval snapshot
+    <approval-id>.json       pending approval snapshot
+```
+
+A worker's `meta.json` looks like:
+
+```jsonc
+{
+  "name": "alpha",
+  "agent": "opencode",
+  "cwd": "/home/me/code/myrepo",
+  "createdAt": "2026-05-14T08:24:39.993Z",
+  "sessionId": "ses_1da6972daffeBusyfkS8aSKAHZ",  // the asset
+  "process": {                                     // transient — gone after detach
+    "pid": 43604,
+    "serverUrl": "http://127.0.0.1:60238",
+    "serverPort": 60238,
+    "startedAt": "2026-05-14T08:24:39.993Z"
+  }
+}
 ```
 
 ## Status
 
-MVP. OpenCode worker path is end-to-end functional and smoke-verified
-against a real LLM round trip. Claude Code worker path is not yet
-implemented; it needs a separate adapter because Claude Code does not have
-the same HTTP/SSE permission API and would have to go through PreToolUse
-HTTP hooks instead.
+MVP. Both OpenCode and Claude Code worker paths are end-to-end smoke-verified
+on this machine, including the session-first lifecycle (spawn → use → detach →
+resume → remove), the approvals queue, and hard-deny enforcement.
