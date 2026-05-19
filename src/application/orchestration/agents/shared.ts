@@ -5,8 +5,8 @@
 
 import {promises as fs} from 'fs';
 import path from 'path';
-import {workerInboxPath, workerMissionPath} from '../paths.js';
-import {workerBootstrapInstructions} from '../templates.js';
+import {workerInboxPath, workerMissionPath} from '../../../infrastructure/filesystem/paths.js';
+import {workerBootstrapInstructions} from '../../../presentation/templates/templates.js';
 
 /**
  * Append a workboss instruction block, marked with an HTML comment so we

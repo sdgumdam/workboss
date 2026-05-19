@@ -12,7 +12,7 @@
  * set OPENCODE_SERVER_PASSWORD before spawning the worker, we pass it here.
  */
 
-import type {ReplyKind} from './types.js';
+import type {ReplyKind} from '../../domain/approval.js';
 
 export interface OpenCodePermissionRequest {
 	id: string;

@@ -4,7 +4,7 @@
  * a JSON request to /rpc and parse the JSON response.
  */
 
-import {readServerPort} from './storage.js';
+import {readServerPort} from '../filesystem/approval-repo.js';
 
 export type RpcRequest =
 	| {kind: 'ping'}

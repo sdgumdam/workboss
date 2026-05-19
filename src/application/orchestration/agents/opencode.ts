@@ -7,13 +7,15 @@ import {
 	listPermissions,
 	replyPermission,
 	subscribeEvents,
-} from '../opencode-client.js';
+} from '../../../infrastructure/http/opencode-client.js';
 import {
 	workerDir,
 	workerOpenCodeConfigPath,
-} from '../paths.js';
-import {defaultOpenCodePermissionConfig} from '../templates.js';
-import type {PendingApproval, WorkerMeta} from '../types.js';
+} from '../../../infrastructure/filesystem/paths.js';
+import {defaultOpenCodePermissionConfig} from '../../../presentation/templates/templates.js';
+import type {WorkerMeta, LivenessResult} from '../../../domain/worker.js';
+import type {PendingApproval} from '../../../domain/approval.js';
+import {isProcessAlive, isProcessStillOurs} from '../../../infrastructure/process/process.js';
 import {injectBootstrapDoc} from './shared.js';
 import type {
 	AgentAdapter,
@@ -85,18 +87,57 @@ function snapshotPermissionRequest(
 class OpenCodeAdapter implements AgentAdapter {
 	readonly kind = 'opencode' as const;
 
+	async checkLiveness(meta: WorkerMeta): Promise<LivenessResult> {
+		const serve = meta.process?.serve;
+		if (!serve?.pid) return {status: 'idle', detail: 'no serve process'};
+
+		if (!isProcessAlive(serve.pid)) {
+			return {status: 'idle', detail: `serve pid ${serve.pid} is gone`};
+		}
+
+		if (!(await isProcessStillOurs(serve.pid, 'opencode'))) {
+			return {status: 'dead', detail: `pid ${serve.pid} reused by another process`};
+		}
+
+		if (serve.serverUrl) {
+			try {
+				const res = await fetch(`${serve.serverUrl}/permission`, {
+					signal: AbortSignal.timeout(2000),
+				});
+				if (!res.ok && res.status !== 401) {
+					return {status: 'dead', detail: `serve HTTP returned ${res.status}`};
+				}
+			} catch {
+				return {status: 'dead', detail: 'serve HTTP unreachable'};
+			}
+		}
+
+		if (meta.process?.tui?.tmuxWindow) {
+			const {execFile} = await import('child_process');
+			const {promisify} = await import('util');
+			try {
+				await promisify(execFile)('tmux', [
+					'list-windows',
+					'-t',
+					'workboss',
+					'-F',
+					'#{window_name}',
+				]);
+			} catch {
+				return {status: 'degraded', detail: 'serve up but workboss tmux session missing'};
+			}
+		}
+
+		return {status: 'up'};
+	}
+
 	async prepareCwd(args: PrepareCwdArgs): Promise<void> {
 		const cfg = workerOpenCodeConfigPath(args.workerName);
-		// Mirror the same config into the worker's runtime dir; opencode reads
-		// it via OPENCODE_CONFIG when we spawn the server.
 		await fs.writeFile(cfg, defaultOpenCodePermissionConfig(), 'utf8');
 		await injectBootstrapDoc(args.cwdAbs, args.workerName, 'AGENTS.md');
 	}
 
 	async prepareCwdMinimal(_args: PrepareCwdArgs): Promise<void> {
-		// OpenCode hands us permission events over SSE on /event with no
-		// per-worker setup required — we just need the URL, which we already
-		// have from discovery. So this is a deliberate no-op.
 	}
 
 	async spawnNew(args: SpawnNewArgs): Promise<SpawnNewResult> {
@@ -139,10 +180,9 @@ class OpenCodeAdapter implements AgentAdapter {
 		try {
 			sessionId = await createSession({baseUrl: url}, args.workerName);
 		} catch (err) {
-			// Server is up but we couldn't bind a session. Surface it as a
-			// warning via postSpawnHint — the worker is still usable.
 			return {
 				process: {pid: child.pid, serverUrl: url, serverPort: port, startedAt},
+				tuiCommand: `opencode attach ${url}`,
 				postSpawnHint: [
 					`  server     : ${url}`,
 					`  session id : (POST /session failed: ${err instanceof Error ? err.message : String(err)})`,
@@ -157,6 +197,7 @@ class OpenCodeAdapter implements AgentAdapter {
 		return {
 			sessionId,
 			process: {pid: child.pid, serverUrl: url, serverPort: port, startedAt},
+			tuiCommand: `opencode attach ${url} --session ${sessionId}`,
 			postSpawnHint: [
 				`  server     : ${url}`,
 				`  session id : ${sessionId}`,
@@ -169,7 +210,7 @@ class OpenCodeAdapter implements AgentAdapter {
 	}
 
 	attachHint(meta: WorkerMeta): AttachHint {
-		const url = meta.process?.serverUrl;
+		const url = meta.process?.serve?.serverUrl;
 		if (!url) {
 			const lines: string[] = [
 				`worker "${meta.name}" has no running opencode server.`,
@@ -203,7 +244,7 @@ class OpenCodeAdapter implements AgentAdapter {
 	}
 
 	async deliverReply(args: DeliverReplyArgs): Promise<void> {
-		const url = args.meta.process?.serverUrl;
+		const url = args.meta.process?.serve?.serverUrl;
 		if (!url) {
 			throw new Error(
 				`worker ${args.meta.name} has no live opencode server; cannot forward reply`,
@@ -218,7 +259,7 @@ class OpenCodeAdapter implements AgentAdapter {
 	}
 
 	subscribe(args: SubscribeArgs): void {
-		const url = args.meta.process?.serverUrl;
+		const url = args.meta.process?.serve?.serverUrl;
 		if (!url) {
 			args.log(
 				`worker ${args.meta.name}: registered (opencode, no live server)`,
@@ -227,8 +268,6 @@ class OpenCodeAdapter implements AgentAdapter {
 		}
 
 		void (async () => {
-			// Import current pending list once so we don't miss anything that
-			// queued before we connected.
 			try {
 				const initial = await listPermissions({baseUrl: url});
 				for (const pr of initial) {

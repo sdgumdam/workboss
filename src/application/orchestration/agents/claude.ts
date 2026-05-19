@@ -4,9 +4,10 @@ import path from 'path';
 import {
 	writeClaudeSettings,
 	type ClaudeHookResponse,
-} from '../claude-config.js';
+} from '../../../infrastructure/agent-config/claude-config.js';
 import {injectBootstrapDoc} from './shared.js';
-import type {WorkerMeta} from '../types.js';
+import type {WorkerMeta, LivenessResult} from '../../../domain/worker.js';
+import {isProcessAlive, isProcessStillOurs} from '../../../infrastructure/process/process.js';
 import type {
 	AgentAdapter,
 	AttachHint,
@@ -21,15 +22,21 @@ import type {
 class ClaudeAdapter implements AgentAdapter {
 	readonly kind = 'claude' as const;
 
-	/**
-	 * Claude is passive — its runtime calls workboss via the PreToolUse HTTP
-	 * hook. When a hook fires, server.ts registers a callback here keyed by
-	 * the synthetic approval id; deliverReply() looks the callback up and
-	 * uses it to write the HTTP response.
-	 *
-	 * Stored on the adapter (not the server module) so all Claude-specific
-	 * state lives in one place.
-	 */
+	async checkLiveness(meta: WorkerMeta): Promise<LivenessResult> {
+		const serve = meta.process?.serve;
+		if (!serve?.pid) return {status: 'idle', detail: 'no process'};
+
+		if (!isProcessAlive(serve.pid)) {
+			return {status: 'idle', detail: `pid ${serve.pid} is gone`};
+		}
+
+		if (!(await isProcessStillOurs(serve.pid, 'claude'))) {
+			return {status: 'dead', detail: `pid ${serve.pid} reused by another process`};
+		}
+
+		return {status: 'up'};
+	}
+
 	private readonly pendingHookResponders = new Map<
 		string,
 		(response: ClaudeHookResponse) => void
@@ -64,13 +71,6 @@ class ClaudeAdapter implements AgentAdapter {
 	}
 
 	async prepareCwdMinimal(args: PrepareCwdArgs): Promise<void> {
-		// settings.local.json is required for the PreToolUse hook to point at
-		// workboss; without it we can't intercept permissions at all.
-		// CLAUDE.md (the inbox protocol primer) is intentionally NOT written
-		// here — we only add that file when the user actually starts using
-		// `workboss message` against this worker, to keep the working tree
-		// clean for cases where the user is happy just having permissions
-		// centralised.
 		await writeClaudeSettings(args.cwdAbs, {
 			workerName: args.workerName,
 			workbossServerUrl: args.workbossServerUrl,
@@ -90,6 +90,7 @@ class ClaudeAdapter implements AgentAdapter {
 			'settings.local.json',
 		);
 		return {
+			tuiCommand: `claude`,
 			postSpawnHint: [
 				`  settings   : ${settingsPath}`,
 				`  session id : (will be learned from first hook call)`,
@@ -116,7 +117,6 @@ class ClaudeAdapter implements AgentAdapter {
 		if (!args.meta.sessionId) {
 			return '(no session id yet; nothing to tail)';
 		}
-		// Claude stores jsonl under ~/.claude/projects/<encoded-cwd>/<sid>.jsonl
 		const encoded = args.meta.cwd.replace(/[\\/.]/g, '-');
 		const jsonl = path.join(
 			os.homedir(),
@@ -150,8 +150,6 @@ class ClaudeAdapter implements AgentAdapter {
 	}
 
 	subscribe(args: SubscribeArgs): void {
-		// Claude is passive — its hook posts to /claude-hook/:worker on
-		// workboss's HTTP server. Nothing to start here.
 		args.log(`worker ${args.meta.name}: registered (claude, passive)`);
 	}
 }

@@ -1,25 +1,15 @@
-import {
-	approve,
-	approvalsList,
-	attachWorker,
-	bossCmd,
-	detachWorker,
-	discoverCmd,
-	listWorkersCmd,
-	messageWorker,
-	printHelp,
-	registerWorker,
-	reject,
-	removeWorker,
-	serverRestart,
-	serverStart,
-	serverStatus,
-	serverStop,
-	showWorker,
-	spawnWorker,
-	tailWorker,
-} from './commands.js';
-import type {AgentKind} from './lib/types.js';
+import { serverStart, serverStop, serverRestart, serverStatus } from '../application/orchestration/commands/server.js';
+import { spawnWorker } from '../application/orchestration/commands/spawn.js';
+import { registerWorker, attachWorker, detachWorker, removeWorker } from '../application/orchestration/commands/lifecycle.js';
+import { listWorkersCmd, showWorker, tailWorker } from '../application/orchestration/commands/inspection.js';
+import { messageWorker } from '../application/orchestration/commands/communication.js';
+import { approvalsList, approve, reject } from '../application/orchestration/commands/approvals.js';
+import { discoverCmd } from '../application/orchestration/commands/discover.js';
+import { bossCmd } from '../application/orchestration/commands/boss.js';
+import { shutdownCmd } from '../application/orchestration/commands/shutdown.js';
+import { runDashboardLoop } from './dashboard/dashboard.js';
+import { printHelp } from '../application/orchestration/commands/help.js';
+import type { AgentKind } from '../domain/worker.js';
 
 interface ParsedArgs {
 	positional: string[];
@@ -99,6 +89,12 @@ async function main(): Promise<void> {
 			return bossCmd({
 				agent: (s(rest, 'agent') as 'opencode' | 'claude' | undefined),
 			});
+
+		case 'dashboard':
+			return runDashboardLoop();
+
+		case 'shutdown':
+			return shutdownCmd();
 
 		case 'spawn': {
 			const name = rest.positional[0];

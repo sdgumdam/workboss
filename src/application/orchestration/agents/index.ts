@@ -1,7 +1,7 @@
 import {claudeAdapter} from './claude.js';
 import {openCodeAdapter} from './opencode.js';
 import type {AgentAdapter} from './types.js';
-import type {AgentKind} from '../types.js';
+import type {AgentKind} from '../../../domain/worker.js';
 
 export {claudeAdapter, openCodeAdapter};
 export type {AgentAdapter} from './types.js';

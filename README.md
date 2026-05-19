@@ -1,180 +1,173 @@
 # workboss
 
-An LLM-supervised manager for a fleet of long-lived coding agent **sessions**,
-across both **OpenCode** and **Claude Code**.
+A tmux-integrated supervisor for fleets of LLM coding agents (OpenCode & Claude Code).
 
-You talk to **one** orchestrator (an OpenCode or Claude Code session pre-loaded
-with the workboss role). It can:
+Workboss gives you **one dashboard** to monitor, approve, and manage all your coding agent sessions — no more tab-switching between terminal windows.
 
-- **Patrol** the fleet: list workers, summarise what each is doing, flag the
-  stuck or idle ones.
-- **Triage** approvals: every permission prompt from every worker is captured
-  into a single queue. You decide once / always / reject — in the orchestrator
-  window, not by tab-switching to each worker's TUI.
-- **Nudge** workers via natural language: it writes to each worker's inbox so
-  the worker picks it up at the start of its next turn.
-- **Spawn** new workers on tasks, **register** sessions you already started by
-  hand, **detach** processes without losing state, and **attach** later by
-  resuming the same session id.
+## What it does
 
-You can still join any worker directly (`opencode attach …` or `claude --resume
-…`) when you want to drive it yourself — the orchestrator is convenience, not
-control.
+```
+┌──────────────────────┬──────────────────────┐
+│                      │  workboss dashboard  │
+│  orchestrator        │                      │
+│  (opencode/claude)   │  ● refactor    up    │
+│                      │  ● test-suite  up    │
+│  Talk to this in     │  ○ docs        idle  │
+│  natural language.   │  ○ cleanup     idle  │
+│                      │                      │
+│                      │  ✓ no pending apps   │
+│                      │      ⏻ shutdown      │
+└──────────────────────┴──────────────────────┘
+```
 
-## Core idea: the session is the asset
-
-A workboss worker is fundamentally a *pointer to an agent session* — the jsonl
-file on disk for Claude Code, or the sqlite row for OpenCode. **That history is
-the durable artifact.** The process running on top of it is replaceable: you
-can kill it, the laptop can crash, you can switch machines — as long as you
-remember the session id, a new process can be bound to it and pick up where it
-left off.
-
-This shapes the tool:
-
-- `workboss spawn` creates a session and remembers its id.
-- `workboss register` adopts an existing session by id (no spawn needed).
-- `workboss detach` kills the current process; the session is preserved.
-- `workboss attach <name>` prints the exact command to resume the session in a
-  new process.
-- `workboss remove` forgets the workboss-level entry; the underlying session
-  data is untouched.
-
-Because both Claude Code and OpenCode store sessions on disk and support
-resume, the two agent backends share the same lifecycle and the same UX.
+- **Dashboard** — real-time TUI showing all workers with liveness status, filterable by active/idle
+- **Orchestrator** — one LLM session that patrols the fleet, triages approvals, nudges workers
+- **Approval queue** — every permission prompt from every worker flows into one queue; you approve/reject once
+- **Session-first lifecycle** — the session is the asset; processes are replaceable
 
 ## Architecture
 
 ```
-┌─ orchestrator (one OpenCode / Claude Code session, role = workboss) ─┐
-│   you talk to this in natural language; it runs `workboss …` for you │
-└────────────────────────────┬─────────────────────────────────────────┘
-                             │
-                             ▼
-┌─ workboss CLI ───────────────────────────────────────────────────────┐
-│   spawn / register / attach / detach / remove                        │
-│   list / show / message / tail                                       │
-│   approvals list / approve / reject                                  │
-└────────────────────────────┬─────────────────────────────────────────┘
-                             │  HTTP /rpc on 127.0.0.1
-                             ▼
-┌─ workboss server (daemon) ───────────────────────────────────────────┐
-│   For OpenCode workers: subscribes to /event SSE                     │
-│   For Claude workers:   exposes POST /claude-hook/:worker            │
-│                         (Claude's PreToolUse HTTP hook target)       │
-│   permission.asked → ~/.workboss/approvals/<id>.json                 │
-│   approve / reject → forwarded back to the worker                    │
-│   enforces hard-deny regex regardless of caller                      │
-└────────────────────────────┬─────────────────────────────────────────┘
-                             │
-                             ▼
-┌─ workers (each one is one agent session bound to one cwd) ───────────┐
-│   OpenCode: `opencode serve` in cwd → session in opencode.db         │
-│   Claude:   `claude` (or `claude --resume <sid>`) in cwd             │
-│                 with .claude/settings.local.json from workboss       │
-└──────────────────────────────────────────────────────────────────────┘
+┌─ orchestrator (one LLM session, role = workboss) ─────────────┐
+│   You talk in natural language; it runs `workboss …` for you  │
+└──────────────────────────┬─────────────────────────────────────┘
+                           │
+                           ▼
+┌─ workboss CLI ─────────────────────────────────────────────────┐
+│   boss / spawn / register / attach / detach / remove          │
+│   list / show / message / tail                                │
+│   approvals list / approve / reject                           │
+│   dashboard / shutdown                                        │
+└──────────────────────────┬─────────────────────────────────────┘
+                           │  HTTP /rpc on 127.0.0.1
+                           ▼
+┌─ workboss server (daemon) ────────────────────────────────────┐
+│   OpenCode workers: subscribes to /event SSE                  │
+│   Claude workers:   exposes POST /claude-hook/:worker         │
+│   permission.asked → ~/.workboss/approvals/<id>.json          │
+│   approve / reject → forwarded back to the worker             │
+│   enforces hard-deny regex regardless of caller               │
+└──────────────────────────┬─────────────────────────────────────┘
+                           │
+                           ▼
+┌─ workers (each is one agent session bound to one cwd) ────────┐
+│   OpenCode: opencode serve --port <P> → session in opencode.db│
+│   Claude:   claude (or claude --resume <sid>) in cwd          │
+└───────────────────────────────────────────────────────────────┘
 ```
 
-## Install (local dev)
+### Layered codebase
+
+```
+src/
+  domain/           — pure interfaces & types (WorkerMeta, TmuxClient, ApprovalRepository)
+  infrastructure/   — implementations (CliTmuxClient, FsWorkerRepository, HTTP adapters)
+  application/      — orchestration logic (commands, agents, session-scanner, daemon)
+  presentation/     — CLI entry point, ink-based dashboard
+```
+
+Dependency inversion: domain defines interfaces; infrastructure implements them. No import from infrastructure → domain.
+
+## Key features
+
+### tmux integration
+
+`workboss boss` creates a tmux session with a horizontal split:
+- **Left pane (70%)**: the orchestrator LLM session
+- **Right pane (30%)**: the real-time dashboard
+
+The divider is draggable (tmux mouse mode). Workers get their own tmux windows — switch with `Ctrl+B n`/`Ctrl+B p`, or select from the dashboard.
+
+### Dashboard
+
+Built with [Ink](https://github.com/vadimdemedes/ink) (React for terminals):
+
+- **Liveness detection** — scans running processes via `ps` + `lsof`, matches by session ID
+- **Orphan cleanup** — detects zombie TUI processes (ppid=1, no TCP connection) and reaps them
+- **Filter** — press `Tab` to cycle: all → active (up/degraded) → idle (idle/dead)
+- **Mouse support** — click to select a worker, click again to jump to its TUI
+- **Keyboard** — ↑↓ navigate, Enter select, `s` shutdown, Ctrl+C quit
+
+### Session-first lifecycle
+
+A workboss worker is a pointer to an agent session. The session data (jsonl for Claude, sqlite for OpenCode) is the durable artifact. Processes are transient:
+
+- `workboss spawn` — creates a session and starts a process
+- `workboss detach` — kills the process, preserves the session
+- `workboss attach` — resumes the session in a new process
+- `workboss remove` — forgets the worker entry; session data on disk is untouched
+
+### Permission model
+
+Every worker gets a permission ruleset:
+- `read`, `webfetch` → auto-allow
+- `edit` → ask the supervisor
+- `bash` → curated allow-list for safe commands, deny-list for dangerous ones, everything else asks
+
+Hard-deny patterns (`rm -rf`, `sudo`, `git push --force`, `curl | sh`) are enforced server-side — cannot be bypassed even by the orchestrator.
+
+## Install
 
 ```bash
+git clone https://github.com/<you>/workboss.git
 cd workboss
 npm install
 npm run build
 alias workboss="node $(pwd)/bin/workboss.js"
 ```
 
-Requires Node ≥ 22, `opencode` on `PATH` for opencode workers, `claude` on
-`PATH` for claude workers.
+Requires Node ≥ 22, `tmux`, `opencode` on PATH (for opencode workers), `claude` on PATH (for claude workers).
 
 ## Quickstart
 
 ```bash
-# 1. Start the supervisor daemon
+# 1. Start the daemon
 workboss server start
 
-# 2A. Create an opencode worker (workboss spawns the server + a session)
-workboss spawn alpha \
-  --task "Read this codebase and propose a refactor for the session module" \
-  --cwd ~/code/myrepo \
+# 2. Launch the boss (creates tmux session with orchestrator + dashboard)
+workboss boss
+
+# 3. From the orchestrator pane, spawn workers:
+#    "spawn a worker named refactor to rewrite the auth module in ~/code/myapp"
+
+# 4. Or from any terminal:
+workboss spawn refactor \
+  --task "Rewrite the auth module to use JWT" \
+  --cwd ~/code/myapp \
   --agent opencode
 
-# 2B. Create a claude worker (workboss prepares files; you start claude yourself)
-workboss spawn beta \
-  --task "Investigate a flaky test in tests/api" \
-  --cwd ~/code/myrepo \
-  --agent claude
+# 5. In the dashboard (right pane):
+#    - ↑↓ to navigate, Enter to jump to a worker's TUI
+#    - Tab to filter active/idle
+#    - s to shutdown everything
+#    - Ctrl+C to quit dashboard
 
-# 3. Workboss prints how to join the worker:
-#    opencode → opencode attach http://127.0.0.1:<P> --session ses_...
-#    claude   → cd ~/code/myrepo && claude
-
-# 4. In another terminal, run the orchestrator (any agent of your choice).
-#    Tell it things like:
-#       "patrol"
-#       "approve alpha's request"
-#       "nudge beta to also check the logs"
-#       "kill alpha but keep the session"
+# 6. When done:
+workboss shutdown          # detach all workers, stop daemon, kill tmux
 ```
-
-## Permission model
-
-Every worker gets a permission ruleset at registration time, picked up by the
-agent on its own. The categories are deliberately the same across both
-agents:
-
-- `read` auto-allow
-- `webfetch` auto-allow
-- `edit` asks the supervisor
-- `bash`: a curated allow-list for read-only / test-runner commands, a curated
-  deny-list for irreversible operations, everything else asks the supervisor
-
-When the worker hits "ask", the request flows into the workboss approvals
-queue. The orchestrator (or you) decides:
-
-- **once** — allow this single request
-- **always** — allow + persist the pattern so similar requests auto-pass
-- **reject** — block (with an optional reason fed back to the LLM)
-
-### Hard deny
-
-`src/lib/deny-patterns.ts` lists patterns that workboss **always rejects**,
-even if the caller (you or the orchestrator) tries to approve them:
-
-- `rm -rf …`, `sudo …`
-- `git push --force` / `-f`, `git reset --hard`, `git checkout -- …`
-- `curl … | sh` / `wget … | bash`
-
-These are checked **server-side** in workboss before any reply is forwarded.
-You can edit a worker's settings to loosen its allow-list, but you cannot
-bypass these regexes by relaxing the worker's own config — the daemon enforces
-them on every approve attempt.
 
 ## CLI reference
 
 ```
-workboss server start | stop | status
+workboss server start | stop | restart | status
 
-# Create a new worker (spawns or sets up a fresh session)
+workboss boss [--agent opencode|claude]     # launch tmux split layout
+workboss dashboard                          # standalone dashboard (ink TUI)
+workboss shutdown                           # full teardown
+
 workboss spawn <name> --task "..." --cwd <path> [--agent opencode|claude]
 workboss spawn <name> --mission <file> --cwd <path>
+workboss register <name> --agent <kind> --cwd <path> --session-id <sid>
 
-# Adopt an existing session you already created elsewhere
-workboss register <name> --agent opencode|claude --cwd <path> \
-                         --session-id <sid> [--server-url <url>]
+workboss list [--history]                   # list workers
+workboss show <name>                        # detailed worker info
+workboss attach <name>                      # resume worker in new process
+workboss detach <name>                      # stop process, keep session
+workboss remove <name>                      # forget worker entry
+workboss message <name> "text"              # send message to worker's inbox
+workboss tail <name> [-n N]                 # recent session activity
 
-# Operate on a worker
-workboss list
-workboss show <name>
-workboss attach <name>            # prints the command to resume in a new process
-workboss message <name> "text"
-workboss tail <name> [-n N]
-
-# Lifecycle
-workboss detach <name>            # stop the current process, keep the session
-workboss remove <name>            # forget the worker entry (session on disk stays)
-
-# Approvals (called by the orchestrator)
+workboss discover [--all] [--register-alive]  # scan for unmanaged sessions
 workboss approvals list
 workboss approve <id> [--always]
 workboss reject <id> --reason "..."
@@ -184,39 +177,26 @@ workboss reject <id> --reason "..."
 
 ```
 ~/.workboss/
-  server.pid                 PID of the running aggregator
-  server.port                127.0.0.1 port the HTTP listener is on
-  server.log                 aggregator stdout
+  server.pid               daemon PID
+  server.port              daemon HTTP port
+  server.log               daemon log
   workers/<name>/
-    meta.json                identity (name, agent, cwd, sessionId) + optional process info
-    opencode.json            OPENCODE_CONFIG (opencode workers only)
-    mission.md               task brief
-    inbox.md                 coordinator notes the worker reads each turn
-    serve.log                stdout/stderr of `opencode serve` (opencode workers only)
+    meta.json              identity + process info
+    opencode.json          OPENCODE_CONFIG (opencode workers)
+    mission.md             task brief
+    inbox.md               coordinator → worker messages
+    serve.log              opencode serve output
   approvals/
-    <approval-id>.json       pending approval snapshot
+    <id>.json              pending approval snapshot
 ```
 
-A worker's `meta.json` looks like:
+## Tech stack
 
-```jsonc
-{
-  "name": "alpha",
-  "agent": "opencode",
-  "cwd": "/home/me/code/myrepo",
-  "createdAt": "2026-05-14T08:24:39.993Z",
-  "sessionId": "ses_1da6972daffeBusyfkS8aSKAHZ",  // the asset
-  "process": {                                     // transient — gone after detach
-    "pid": 43604,
-    "serverUrl": "http://127.0.0.1:60238",
-    "serverPort": 60238,
-    "startedAt": "2026-05-14T08:24:39.993Z"
-  }
-}
-```
+- **Runtime**: Node.js ≥ 22, TypeScript
+- **TUI**: [Ink](https://github.com/vadimdemedes/ink) (React for terminals) with mouse support
+- **Terminal**: tmux 3.x with split layout + mouse mode
+- **Agents**: OpenCode (serve + attach), Claude Code (--resume)
 
 ## Status
 
-MVP. Both OpenCode and Claude Code worker paths are end-to-end smoke-verified
-on this machine, including the session-first lifecycle (spawn → use → detach →
-resume → remove), the approvals queue, and hard-deny enforcement.
+MVP. Both OpenCode and Claude Code paths are end-to-end verified: spawn → use → detach → attach → remove, approval queue, hard-deny enforcement, dashboard with liveness detection, orphan cleanup, and full shutdown.

@@ -9,7 +9,8 @@
  * each time we support a new runtime.
  */
 
-import type {AgentKind, PendingApproval, ReplyKind, WorkerMeta} from '../types.js';
+import type {AgentKind, LivenessResult, WorkerMeta} from '../../../domain/worker.js';
+import type {PendingApproval, ReplyKind} from '../../../domain/approval.js';
 
 // ---------- spawn ----------
 
@@ -30,6 +31,14 @@ export interface SpawnNewResult {
 		serverPort?: number;
 		startedAt: string;
 	};
+	/**
+	 * The command that launches the worker's interactive TUI.
+	 * When workboss is inside its tmux session, commands.ts opens a new
+	 * tmux window and runs this command there so the user can see the
+	 * agent working.  When tmux is not available the string is printed
+	 * as a hint instead.
+	 */
+	tuiCommand?: string;
 	/** Lines workboss prints after `spawn` completes. */
 	postSpawnHint: string[];
 }
@@ -73,6 +82,8 @@ export interface SubscribeArgs {
 	log: (msg: string) => void;
 }
 
+// ---------- liveness (status codes defined in lib/types.ts) ----------
+
 // ---------- adapter ----------
 
 export interface AgentAdapter {
@@ -85,6 +96,17 @@ export interface AgentAdapter {
 	 * starts the binary themselves.
 	 */
 	spawnNew(args: SpawnNewArgs): Promise<SpawnNewResult>;
+
+	/**
+	 * Check whether this worker's runtime is alive, degraded, or dead.
+	 *
+	 * - up:       all processes healthy, user can see the TUI
+	 * - degraded: backend (serve) is up but TUI window is missing or unreachable
+	 * - idle:     no process running (session data preserved on disk)
+	 * - dead:     PID exists but is not our process (reused by OS), or serve
+	 *             is unreachable
+	 */
+	checkLiveness(meta: WorkerMeta): Promise<LivenessResult>;
 
 	/**
 	 * Idempotently set up <cwd> so that any future agent session started in

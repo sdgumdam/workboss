@@ -41,18 +41,6 @@ const UUID_RE =
 
 // ---------- live processes ----------
 
-/**
- * Recover the session id of a running `claude` process whose command line
- * does not carry `--resume <uuid>`. Claude writes the live conversation
- * jsonl in real time, so the most-recently-modified jsonl inside the
- * process's cwd-encoded project directory is almost always the session it
- * is actively writing to.
- *
- * Claude collapses `/`, `_`, and `.` to `-` in the directory name; the
- * leading `/` of an absolute path becomes a leading `-`. We accept a
- * generous staleness window (24h) so an idle but still-attached session is
- * picked up.
- */
 async function findCurrentClaudeSessionId(
 	cwd: string,
 ): Promise<string | undefined> {
@@ -121,15 +109,6 @@ async function fetchOpencodeLatestSession(
 	return undefined;
 }
 
-/**
- * For an `opencode` TUI process (no HTTP API exposed): recover the session
- * id it is most likely working on by asking the opencode sqlite database
- * for the most-recently-updated session that lives in this cwd.
- *
- * Mirrors the claude-jsonl-mtime trick: OpenCode persists session state in
- * sqlite as the user talks to the TUI, so the highest time_updated in this
- * cwd is the live session.
- */
 async function findOpencodeSessionForCwd(
 	cwd: string,
 ): Promise<string | undefined> {
@@ -161,10 +140,6 @@ async function findOpencodeSessionForCwd(
 	}
 }
 
-/**
- * Parse one `ps -eo pid=,args=` line for opencode/claude invocations.
- * Returns null when the line is not interesting.
- */
 function classifyPsLine(line: string): {
 	pid: number;
 	hit:
@@ -185,40 +160,57 @@ function classifyPsLine(line: string): {
 		return {pid, hit: {agent: 'opencode', port: Number.parseInt(serve[1]!, 10)}};
 	}
 
-	// 2. opencode attach <url>: this is a *client* of another server, not a
-	// worker. Skip — the server it's attached to will show up on its own (or
-	// is the workboss-spawned one we already know).
+	// 2. opencode attach <url>: client of another server, not a worker.
 	if (/\bopencode\s+attach\b/.test(args)) {
 		return {pid, hit: {agent: 'opencode', isAttachClient: true}};
 	}
 
 	// 3. opencode --session ses_xxx / opencode -s ses_xxx (TUI mode with
-	// explicit session). No HTTP API but sid is right in the cmdline.
+	// explicit session).
 	const sessionFlag = args.match(/\bopencode\b[^|]*?(?:--session|\s-s)\s+(ses_\S+)/);
 	if (sessionFlag) {
 		return {pid, hit: {agent: 'opencode', sessionId: sessionFlag[1]}};
 	}
 
 	// 4. Bare `opencode` (or `opencode <project>`): TUI mode, no API, no
-	// explicit sid in cmdline. We'll recover sid by querying the sqlite db
-	// at lookup time using cwd.
+	// explicit sid in cmdline.
 	if (/(?:^|\s|\/)opencode(?:\s|$)/.test(args) && !args.includes(' --')) {
 		return {pid, hit: {agent: 'opencode'}};
 	}
-	// Also catch `opencode <project>` where <project> is positional.
 	if (/^(?:\S+\/)?opencode\s/.test(args.trimStart())) {
 		return {pid, hit: {agent: 'opencode'}};
 	}
 
 	// 5. claude  (with or without --resume <uuid>)
+	//    Skip VSCode extension instances (--output-format stream-json).
 	const claudeBin = /(?:^|\s|\/)claude(?:\s|$)/.test(args);
-	if (claudeBin) {
+	if (claudeBin && !args.includes('--output-format')) {
 		const resume = args.match(/--resume\s+(\S+)/);
 		const sessionId =
 			resume && UUID_RE.test(resume[1] ?? '') ? resume[1]! : undefined;
 		return {pid, hit: {agent: 'claude', sessionId}};
 	}
 	return null;
+}
+
+async function hasNetworkConnection(pid: number): Promise<boolean> {
+	try {
+		const {stdout} = await execFileAsync('lsof', [
+			'-a', '-p', String(pid), '-iTCP', '-sTCP:ESTABLISHED', '-P', '-n',
+		]);
+		return stdout.trim().length > 0;
+	} catch {
+		return false;
+	}
+}
+
+async function isOrphan(pid: number): Promise<boolean> {
+	try {
+		const {stdout} = await execFileAsync('ps', ['-p', String(pid), '-o', 'ppid=']);
+		return stdout.trim() === '1';
+	} catch {
+		return true;
+	}
 }
 
 export async function findAliveAgents(): Promise<DiscoveredSession[]> {
@@ -240,10 +232,18 @@ export async function findAliveAgents(): Promise<DiscoveredSession[]> {
 		const cwd = await lsofCwd(c.pid);
 
 		if (c.hit.agent === 'opencode') {
-			// Attach clients aren't workers themselves; the server they're
-			// pointing at is. Skip — workboss either knows about that server
-			// or it'll be picked up via its own process row.
 			if (c.hit.isAttachClient) continue;
+
+			if (c.hit.port === undefined) {
+				const [orphan, connected] = await Promise.all([
+					isOrphan(c.pid),
+					hasNetworkConnection(c.pid),
+				]);
+				if (orphan && !connected) {
+					try { process.kill(c.pid, 'SIGTERM'); } catch {}
+					continue;
+				}
+			}
 
 			let serverUrl: string | undefined;
 			let sessionId: string | undefined = c.hit.sessionId;
@@ -254,7 +254,6 @@ export async function findAliveAgents(): Promise<DiscoveredSession[]> {
 					sessionId = await fetchOpencodeLatestSession(serverUrl);
 				}
 			} else if (!sessionId && cwd) {
-				// TUI mode, no HTTP, no cmdline sid → ask the sqlite db.
 				sessionId = await findOpencodeSessionForCwd(cwd);
 			}
 
@@ -374,8 +373,6 @@ export async function findClaudeHistory(): Promise<DiscoveredSession[]> {
 					/* skip */
 				}
 				if (!cwd) {
-					// directory-name reconstruction is ambiguous (both '/' and '_'
-					// collapse to '-'); we only use it if it stat's clean.
 					const guess = dir.replace(/^-/, '/').replace(/-/g, '/');
 					try {
 						const st = await fs.stat(guess);
@@ -483,7 +480,6 @@ export async function discoverAll(): Promise<DiscoveredSession[]> {
 
 	const out = [...alive, ...historical];
 	out.sort((a, b) => {
-		// alive first, then by lastActivity desc
 		if (a.alive !== b.alive) return a.alive ? -1 : 1;
 		const at = a.lastActivity?.getTime() ?? 0;
 		const bt = b.lastActivity?.getTime() ?? 0;
