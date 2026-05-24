@@ -15,6 +15,7 @@ import {
 } from '../../../infrastructure/tmux/tmux.js';
 
 import {ok, ensureServerUp} from './utils.js';
+import {ORCHESTRATOR_STATE_FILE} from '../../../infrastructure/filesystem/paths.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -66,6 +67,12 @@ export async function bossCmd(args: {
 
 		await sendKeys(LEFT_PANE, cmd);
 		await sendKeys(RIGHT_PANE, 'workboss dashboard');
+
+		await fs.writeFile(
+			ORCHESTRATOR_STATE_FILE,
+			JSON.stringify({agent, cwd: SUPERVISOR_HOME}),
+			'utf8',
+		);
 
 		ok(`workboss boss: launching ${agent} in tmux session "${WORKBOSS_SESSION}"`);
 		ok(`  left pane : orchestrator`);

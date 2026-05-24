@@ -125,8 +125,11 @@ async function findOpencodeSessionForCwd(
 		return undefined;
 	}
 	const sql =
-		`SELECT id FROM session WHERE directory = '${cwd.replace(/'/g, "''")}' ` +
-		`AND time_archived IS NULL ORDER BY time_updated DESC LIMIT 1;`;
+		`SELECT s.id FROM session s ` +
+		`WHERE s.directory = '${cwd.replace(/'/g, "''")}' ` +
+		`AND s.time_archived IS NULL ` +
+		`AND EXISTS (SELECT 1 FROM message m WHERE m.session_id = s.id) ` +
+		`ORDER BY s.time_updated DESC LIMIT 1;`;
 	try {
 		const {stdout} = await execFileAsync(
 			'sqlite3',

@@ -1,10 +1,10 @@
 import type {WorkerMeta} from '../../../domain/worker.js';
-import {readServerPort} from '../../../infrastructure/filesystem/approval-repo.js';
 import {FsWorkerRepository} from '../../../infrastructure/filesystem/worker-repo.js';
 import {getAdapter} from '../agents/index.js';
 import type {DiscoveredSession} from '../session-scanner.js';
 import {discoverAll} from '../session-scanner.js';
 import {shortSid, shortCwd, fmtAge} from '../../../presentation/format.js';
+import {rpcCall} from '../../../infrastructure/http/server-rpc.js';
 
 import {ok, fail, loadWorker} from './utils.js';
 
@@ -86,7 +86,7 @@ export async function listWorkersCmd(opts: ListOptions = {}): Promise<void> {
 		}
 	}
 
-	if (!(await readServerPort())) {
+	if (!(await rpcCall({kind: 'ping'})).ok) {
 		ok('');
 		ok('(workboss server 没在跑；新 worker 不会被自动收编)');
 	}

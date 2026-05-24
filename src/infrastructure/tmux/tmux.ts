@@ -1,8 +1,10 @@
 import {execFile} from 'child_process';
 import {promisify} from 'util';
 import type {TmuxClient} from '../../domain/tmux.js';
+import {createLogger} from '../logging/logger.js';
 
 const execFileAsync = promisify(execFile);
+const logger = createLogger('tmux');
 
 export const WORKBOSS_SESSION = 'workboss';
 export const WORKBOSS_WINDOW = 'boss';
@@ -135,4 +137,60 @@ export async function selectWindow(name: string): Promise<void> {
 
 export async function sendKeys(target: string, command: string): Promise<void> {
 	await run(['send-keys', '-t', target, command, 'Enter']);
+}
+
+function isBareTUI(cmd: string): boolean {
+	const base = cmd.trim();
+	return /^(?:\S+\/)?opencode(?:\s|$)/.test(base) && !base.includes('attach') && !base.includes('serve');
+}
+
+export async function getLeftPaneChildCommand(): Promise<{pid: number; cmd: string} | null> {
+	try {
+		const {stdout: pidStr} = await execFileAsync('tmux', [
+			'display-message', '-t', LEFT_PANE, '-p', '#{pane_pid}',
+		]);
+		const shellPid = parseInt(pidStr.trim(), 10);
+		if (!Number.isFinite(shellPid)) return null;
+		const {stdout: children} = await execFileAsync('pgrep', ['-P', String(shellPid)]);
+		const childPids = children.trim().split('\n').filter(Boolean);
+		if (childPids.length === 0) return null;
+		const pid = parseInt(childPids[0]!, 10);
+		const {stdout: cmd} = await execFileAsync('ps', ['-p', String(pid), '-o', 'command=']);
+		return {pid, cmd: cmd.trim()};
+	} catch {
+		return null;
+	}
+}
+
+export async function runInLeftPane(command: string): Promise<void> {
+	logger.info('runInLeftPane start', {command});
+
+	const child = await getLeftPaneChildCommand();
+	if (child) {
+		if (isBareTUI(child.cmd)) {
+			logger.info('left pane has bare opencode TUI, sending Ctrl-C for graceful exit', {pid: child.pid});
+			await run(['send-keys', '-t', LEFT_PANE, 'C-c']);
+			for (let i = 0; i < 30; i++) {
+				await new Promise((r) => setTimeout(r, 200));
+				const {stdout: cmd} = await execFileAsync('tmux', [
+					'display-message', '-t', LEFT_PANE, '-p', '#{pane_current_command}',
+				]);
+				if (cmd.trim() === 'zsh' || cmd.trim() === 'bash' || cmd.trim() === 'sh') break;
+			}
+		} else {
+			try { process.kill(child.pid, 'SIGKILL'); } catch {}
+			logger.info('sent SIGKILL to pane child', {pid: child.pid});
+			for (let i = 0; i < 20; i++) {
+				await new Promise((r) => setTimeout(r, 100));
+				const {stdout: cmd} = await execFileAsync('tmux', [
+					'display-message', '-t', LEFT_PANE, '-p', '#{pane_current_command}',
+				]);
+				if (cmd.trim() === 'zsh' || cmd.trim() === 'bash' || cmd.trim() === 'sh') break;
+			}
+		}
+	}
+
+	logger.info('sending command', {command});
+	await run(['send-keys', '-t', LEFT_PANE, command, 'Enter']);
+	logger.info('runInLeftPane done');
 }

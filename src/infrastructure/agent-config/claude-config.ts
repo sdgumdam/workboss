@@ -25,38 +25,16 @@ export interface ClaudeSettingsParams {
 }
 
 export function buildClaudeSettings(p: ClaudeSettingsParams): unknown {
-	const hookUrl = `${p.workbossServerUrl}/claude-hook/${encodeURIComponent(p.workerName)}`;
 	return {
 		permissions: {
 			allow: [
+				'Edit',
+				'Write',
+				'MultiEdit',
 				'Read(**)',
-				'Bash(ls *)',
-				'Bash(cat *)',
-				'Bash(grep *)',
-				'Bash(rg *)',
-				'Bash(find *)',
-				'Bash(pwd)',
-				'Bash(git status)',
-				'Bash(git diff*)',
-				'Bash(git log*)',
-				'Bash(git branch*)',
-				'Bash(git show*)',
-				'Bash(npm test*)',
-				'Bash(npm run test*)',
-				'Bash(bun test*)',
-				'Bash(pytest*)',
-				'Bash(curl *)',
-				'Bash(wget *)',
 				'WebFetch',
 			],
-			deny: [
-				'Bash(rm -rf *)',
-				'Bash(sudo *)',
-				'Bash(git push --force*)',
-				'Bash(git push -f*)',
-				'Bash(git reset --hard*)',
-				'Bash(git checkout -- *)',
-			],
+			deny: [],
 		},
 		hooks: {
 			PreToolUse: [
@@ -65,7 +43,7 @@ export function buildClaudeSettings(p: ClaudeSettingsParams): unknown {
 					hooks: [
 						{
 							type: 'http',
-							url: hookUrl,
+							url: `${p.workbossServerUrl}/claude-hook/${encodeURIComponent(p.workerName)}`,
 							timeout: p.hookTimeoutSec ?? 300,
 						},
 					],

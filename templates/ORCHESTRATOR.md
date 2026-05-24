@@ -27,7 +27,7 @@
 
 1. 跑 `workboss list`。
 2. 跑 `workboss approvals list`。
-3. 把两步合成**一段话能扫完**的汇总，例如：
+3. 输出格式如下（只列出 up/degraded 的 worker，不列 idle）：
    ```
    alpha  opencode  up    ses_1da6…  ~/code/foo
    beta   claude    up    4affc813…  ~/project/4k对比

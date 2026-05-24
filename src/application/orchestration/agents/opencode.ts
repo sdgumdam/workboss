@@ -209,6 +209,48 @@ class OpenCodeAdapter implements AgentAdapter {
 		};
 	}
 
+	async resumeServe(args: {
+		workerName: string;
+		cwdAbs: string;
+		workbossServerUrl: string;
+	}): Promise<{pid: number; serverUrl: string; serverPort: number}> {
+		await this.prepareCwd({
+			workerName: args.workerName,
+			cwdAbs: args.cwdAbs,
+			workbossServerUrl: args.workbossServerUrl,
+		});
+
+		const port = await findFreePort();
+		const url = `http://127.0.0.1:${port}`;
+		const env: NodeJS.ProcessEnv = {
+			...process.env,
+			OPENCODE_CONFIG: workerOpenCodeConfigPath(args.workerName),
+		};
+		const logPath = path.join(workerDir(args.workerName), 'serve.log');
+		const out = await fs.open(logPath, 'a');
+		const child = spawnChild(
+			'opencode',
+			['serve', '--port', String(port), '--hostname', '127.0.0.1'],
+			{
+				cwd: args.cwdAbs,
+				env,
+				detached: true,
+				stdio: ['ignore', out.fd, out.fd],
+			},
+		);
+		child.unref();
+		out.close().catch(() => {});
+
+		const ready = await waitForReady(url, 15000);
+		if (!ready) {
+			throw new Error(
+				`opencode serve did not become ready within 15s. Check ${logPath}`,
+			);
+		}
+
+		return {pid: child.pid!, serverUrl: url, serverPort: port};
+	}
+
 	attachHint(meta: WorkerMeta): AttachHint {
 		const url = meta.process?.serve?.serverUrl;
 		if (!url) {

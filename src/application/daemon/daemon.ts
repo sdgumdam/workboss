@@ -1,10 +1,8 @@
 import http from 'http';
-import type {AddressInfo} from 'net';
 import type {WorkerMeta} from '../../domain/worker.js';
 import type {PendingApproval} from '../../domain/approval.js';
 import type {WorkerRepository} from '../../domain/worker.js';
 import type {ApprovalRepository} from '../../domain/approval.js';
-import {writeServerInfo, clearServerInfo} from '../../infrastructure/filesystem/approval-repo.js';
 import {matchHardDeny} from '../../infrastructure/agent-config/deny-patterns.js';
 import {
   classifyToolName,
@@ -15,16 +13,15 @@ import {getAdapter, claudeAdapter} from '../orchestration/agents/index.js';
 import type {WorkerPatrol} from './worker-patrol.js';
 import type {LivenessWatcher} from './liveness-watcher.js';
 import type {RpcRequest, RpcResponse} from '../../infrastructure/http/server-rpc.js';
+import {createLogger} from '../../infrastructure/logging/logger.js';
+import {getServerPort, getServerUrl} from '../../infrastructure/filesystem/paths.js';
 
 interface Registration {
   meta: WorkerMeta;
   abort: AbortController;
 }
 
-function log(...args: unknown[]): void {
-  const ts = new Date().toISOString();
-  console.log(`[${ts}]`, ...args);
-}
+const logger = createLogger('daemon');
 
 export class Daemon {
   private workerRepo: WorkerRepository;
@@ -58,7 +55,7 @@ export class Daemon {
         const r = this.registry.get(meta.name);
         if (r) r.meta.sessionId = sid;
       },
-      log,
+      log: (msg: string) => logger.info(msg),
     });
   }
 
@@ -67,7 +64,7 @@ export class Daemon {
     if (!r) return;
     r.abort.abort();
     this.registry.delete(name);
-    log(`worker ${name}: unregistered`);
+    logger.info(`worker ${name}: unregistered`);
   }
 
   private async forwardReply(req: {
@@ -81,20 +78,9 @@ export class Daemon {
       return {ok: false, error: `approval ${req.id} not found or already handled`};
     }
 
-    if (req.reply !== 'reject') {
-      const hit = matchHardDeny(target.permission, target.patterns);
-      if (hit) {
-        log(
-          `HARD DENY ${target.worker}/${target.id}: ${hit.reason} (${JSON.stringify(target.patterns)})`,
-        );
-        await this.deliverThrough(target, 'reject', `workboss policy: ${hit.reason}`);
-        return {ok: false, error: `forbidden by workboss policy: ${hit.reason}`};
-      }
-    }
-
     try {
       await this.deliverThrough(target, req.reply, req.message);
-      log(`replied ${target.worker}/${target.id} ${req.reply}`);
+      logger.info(`replied ${target.worker}/${target.id} ${req.reply}`);
       return {ok: true};
     } catch (err) {
       return {ok: false, error: `forward reply failed: ${String(err)}`};
@@ -107,13 +93,25 @@ export class Daemon {
     message: string | undefined,
   ): Promise<void> {
     const reg = this.registry.get(target.worker);
-    if (!reg) throw new Error(`worker ${target.worker} not registered`);
-    await getAdapter(reg.meta.agent).deliverReply({
-      meta: reg.meta,
-      approval: target,
-      reply,
-      message,
-    });
+    if (!reg) {
+      await this.approvalRepo.delete(target.id);
+      throw new Error(`worker ${target.worker} not registered — approval discarded`);
+    }
+    try {
+      await getAdapter(reg.meta.agent).deliverReply({
+        meta: reg.meta,
+        approval: target,
+        reply,
+        message,
+      });
+    } catch (err) {
+      const msg = String(err);
+      if (msg.includes('no longer waiting')) {
+        logger.info(`approval ${target.id}: hook responder gone, discarding approval`);
+      } else {
+        throw err;
+      }
+    }
     await this.approvalRepo.delete(target.id);
   }
 
@@ -181,7 +179,7 @@ export class Daemon {
   ): Promise<void> {
     const reg = this.registry.get(workerName);
     if (!reg) {
-      log(`claude hook from unknown worker "${workerName}", returning ask`);
+      logger.info(`claude hook from unknown worker "${workerName}", returning ask`);
       this.sendClaudeHookDecision(res, 'ask', `workboss does not know worker "${workerName}"`);
       return;
     }
@@ -205,7 +203,7 @@ export class Daemon {
     if (body.session_id && !reg.meta.sessionId) {
       await this.workerRepo.update(workerName, m => ({...m, sessionId: body.session_id}));
       reg.meta.sessionId = body.session_id;
-      log(`${workerName}: learned session_id=${body.session_id}`);
+      logger.info(`${workerName}: learned session_id=${body.session_id}`);
     }
 
     const permission = classifyToolName(body.tool_name);
@@ -213,64 +211,56 @@ export class Daemon {
 
     const hit = matchHardDeny(permission, patterns);
     if (hit) {
-      log(
-        `HARD DENY (inline) ${workerName} ${body.tool_name}: ${hit.reason} (${JSON.stringify(patterns)})`,
+      logger.info(
+        `QUEUE APPROVAL ${workerName} ${body.tool_name}: ${hit.reason} (${JSON.stringify(patterns)})`,
       );
-      this.sendClaudeHookDecision(res, 'deny', `workboss policy: ${hit.reason}`);
+      const approvalId = `claude_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+      const approval: PendingApproval = {
+        id: approvalId,
+        worker: workerName,
+        sessionID: body.session_id ?? '',
+        permission,
+        patterns,
+        metadata: { tool_name: body.tool_name, tool_input: body.tool_input },
+        always: [],
+        capturedAt: new Date().toISOString(),
+      };
+      await this.approvalRepo.write(approval);
+
+      const HOOK_TIMEOUT_MS = 60_000;
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        claudeAdapter.dropHookResponder(approvalId);
+        void this.approvalRepo.delete(approvalId);
+        logger.info(`claude hook ${approvalId} timed out, returning ask`);
+        this.sendClaudeHookDecision(res, 'ask', 'workboss: no orchestrator response within 60s');
+      }, HOOK_TIMEOUT_MS);
+
+      claudeAdapter.registerHookResponder(approvalId, (response) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.sendJson(res, 200, response);
+      });
+
+      res.on('close', () => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          claudeAdapter.dropHookResponder(approvalId);
+          logger.info(`claude hook ${approvalId} dropped by client before reply — keeping approval for orchestrator`);
+        }
+      });
       return;
     }
 
-    const approvalId = `claude_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-    const approval: PendingApproval = {
-      id: approvalId,
-      worker: workerName,
-      sessionID: body.session_id ?? '',
-      permission,
-      patterns,
-      metadata: {tool_name: body.tool_name, tool_input: body.tool_input},
-      always: [],
-      capturedAt: new Date().toISOString(),
-    };
-    await this.approvalRepo.write(approval);
-    log(
-      `${workerName}: claude hook captured id=${approvalId} ${body.tool_name} ${JSON.stringify(patterns)}`,
-    );
-
-    const HOOK_TIMEOUT_MS = 30_000;
-
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      claudeAdapter.dropHookResponder(approvalId);
-      void this.approvalRepo.delete(approvalId);
-      log(`claude hook ${approvalId} timed out, returning ask`);
-      this.sendClaudeHookDecision(
-        res,
-        'ask',
-        'workboss: no orchestrator response within 30s, please decide in worker TUI',
-      );
-    }, HOOK_TIMEOUT_MS);
-
-    claudeAdapter.registerHookResponder(approvalId, response => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      this.sendJson(res, 200, response);
-    });
-
-    res.on('close', () => {
-      if (!settled) {
-        settled = true;
-        clearTimeout(timer);
-        claudeAdapter.dropHookResponder(approvalId);
-        void this.approvalRepo.delete(approvalId);
-        log(`claude hook ${approvalId} dropped by client before reply`);
-      }
-    });
+    this.sendClaudeHookDecision(res, 'allow', '');
+    return;
   }
 
-  private startHttpServer(): Promise<number> {
+  private startHttpServer(): Promise<void> {
     return new Promise((resolve, reject) => {
       const server = http.createServer((req, res) => {
         (async () => {
@@ -298,41 +288,50 @@ export class Daemon {
         });
       });
       server.on('error', reject);
-      server.listen(0, '127.0.0.1', () => {
-        const addr = server.address() as AddressInfo | null;
-        if (!addr || typeof addr !== 'object') {
-          reject(new Error('bad listen'));
-          return;
-        }
-        resolve(addr.port);
+      const port = getServerPort();
+      server.listen(port, '127.0.0.1', () => {
+        resolve();
       });
     });
   }
 
   async run(): Promise<void> {
-    const port = await this.startHttpServer();
-    await writeServerInfo(process.pid, port);
-    const workbossUrl = `http://127.0.0.1:${port}`;
-    log(`workboss server up on ${workbossUrl}, pid=${process.pid}`);
+    await this.startHttpServer();
+    const workbossUrl = getServerUrl();
+    logger.info(`workboss server up on ${workbossUrl}, pid=${process.pid}`);
+
+    for (const meta of await this.workerRepo.list()) {
+      if (meta.agent === 'claude') {
+        const {writeClaudeSettings} = await import(
+          '../../infrastructure/agent-config/claude-config.js'
+        );
+        await writeClaudeSettings(meta.cwd, {
+          workerName: meta.name,
+          workbossServerUrl: workbossUrl,
+        }).catch(err =>
+          logger.info(`update claude settings ${meta.name} failed: ${String(err)}`),
+        );
+      }
+    }
 
     for (const meta of await this.workerRepo.list()) {
       await this.registerForEvents(meta).catch(err =>
-        log(`attach ${meta.name} failed: ${String(err)}`),
+        logger.info(`attach ${meta.name} failed: ${String(err)}`),
       );
     }
 
     await this.workerPatrol.sweep(workbossUrl).catch(err =>
-      log(`initial sweep failed: ${String(err)}`),
+      logger.info(`initial sweep failed: ${String(err)}`),
     );
     const sweepInterval = setInterval(() => {
       void this.workerPatrol.sweep(workbossUrl).catch(err =>
-        log(`sweep failed: ${String(err)}`),
+        logger.info(`sweep failed: ${String(err)}`),
       );
     }, 60_000);
     sweepInterval.unref();
 
     const shutdown = async (sig: string) => {
-      log(`received ${sig}, shutting down`);
+      logger.info(`received ${sig}, shutting down`);
       for (const r of this.registry.values()) r.abort.abort();
       claudeAdapter.respondToAllPending({
         hookSpecificOutput: {
@@ -341,7 +340,6 @@ export class Daemon {
           permissionDecisionReason: 'workboss server is shutting down',
         },
       });
-      await clearServerInfo();
       process.exit(0);
     };
     process.on('SIGINT', () => void shutdown('SIGINT'));

@@ -1,16 +1,29 @@
-import {spawn} from 'child_process';
 import {promises as fs} from 'fs';
+import {execFile} from 'child_process';
+import {promisify} from 'util';
 import os from 'os';
 import {useState, useEffect, useCallback, useMemo, useRef} from 'react';
 import {render, Box, Text, useApp, useInput, useStdout} from 'ink';
 
 import type {LivenessStatus, WorkerMeta, WorkerRepository} from '../../domain/worker.js';
-import type {ApprovalRepository} from '../../domain/approval.js';
+import type {ApprovalRepository, PendingApproval} from '../../domain/approval.js';
 import {FsWorkerRepository} from '../../infrastructure/filesystem/worker-repo.js';
 import {FsApprovalRepository} from '../../infrastructure/filesystem/approval-repo.js';
-import {workerMissionPath} from '../../infrastructure/filesystem/paths.js';
+import {workerMissionPath, ORCHESTRATOR_STATE_FILE, getServerPort} from '../../infrastructure/filesystem/paths.js';
 import {getAdapter} from '../../application/orchestration/agents/index.js';
 import {findAliveAgents} from '../../application/orchestration/session-scanner.js';
+import {
+	runInLeftPane,
+	LEFT_PANE,
+	getLeftPaneChildCommand,
+} from '../../infrastructure/tmux/tmux.js';
+import {createLogger} from '../../infrastructure/logging/logger.js';
+import {isProcessAlive} from '../../infrastructure/process/process.js';
+import {pingDaemon} from '../../application/orchestration/commands/server.js';
+import {rpcCall} from '../../infrastructure/http/server-rpc.js';
+
+const execFileAsync = promisify(execFile);
+const logger = createLogger('dashboard');
 
 const LIVENESS_ORDER: Record<LivenessStatus, number> = {
 	up: 0, degraded: 1, idle: 2, dead: 3,
@@ -31,8 +44,13 @@ const AGENT_ICON: Record<string, string> = {
 
 export type DashboardAction =
 	| {kind: 'worker'; name: string}
+	| {kind: 'back'}
 	| {kind: 'shutdown'}
-	| {kind: 'quit'};
+	| {kind: 'quit'}
+	| {kind: 'approve'; id: string}
+	| {kind: 'reject'; id: string}
+	| {kind: 'approve-all'}
+	| {kind: 'reject-all'};
 
 interface DashboardProps {
 	workerRepo: WorkerRepository;
@@ -46,6 +64,7 @@ interface WorkerDisplay {
 	status: LivenessStatus;
 	agent: string;
 	cwd: string;
+	sessionId: string;
 	shortSid: string;
 	pid?: number;
 }
@@ -99,6 +118,26 @@ function deriveDisplayName(name: string, cwd: string): string {
 	if (!name.startsWith('auto-')) return name;
 	const segments = cwd.replace(os.homedir(), '~').split('/');
 	return segments[segments.length - 1] || name;
+}
+
+async function getLeftPaneSessionId(): Promise<string | null> {
+	try {
+		const {stdout: panePid} = await execFileAsync('tmux', [
+			'display-message', '-t', LEFT_PANE, '-p', '#{pane_pid}',
+		]);
+		const shellPid = parseInt(panePid.trim(), 10);
+		if (!Number.isFinite(shellPid)) return null;
+		const {stdout: children} = await execFileAsync('pgrep', ['-P', String(shellPid)]);
+		const childPids = children.trim().split('\n').filter(Boolean);
+		for (const cpid of childPids) {
+			try {
+				const {stdout: cmd} = await execFileAsync('ps', ['-p', cpid, '-o', 'command=']);
+				const m = cmd.match(/--session\s+(\S+)/);
+				if (m) return m[1];
+			} catch {}
+		}
+	} catch {}
+	return null;
 }
 
 async function readMissionTitle(name: string): Promise<string> {
@@ -174,9 +213,10 @@ function sortByLiveness(workers: WorkerDisplay[]): WorkerDisplay[] {
 const HEADER_ROWS = 2;
 const FOOTER_ROWS = 4;
 
-function WorkerRow({worker, selected}: {
+function WorkerRow({worker, selected, isCurrent}: {
 	worker: WorkerDisplay;
 	selected: boolean;
+	isCurrent: boolean;
 }) {
 	const icon = LIVENESS_ICON[worker.status] ?? '○';
 	const color = LIVENESS_COLOR[worker.status] ?? 'gray';
@@ -186,6 +226,7 @@ function WorkerRow({worker, selected}: {
 	return (
 		<Text wrap="truncate">
 			<Text color={selected ? 'blue' : undefined}>{prefix} </Text>
+			{isCurrent ? <Text color="cyan">►</Text> : <Text> </Text>}
 			<Text color={color}>{icon}</Text>
 			<Text> </Text>
 			<Text dimColor>{agentIcon}</Text>
@@ -218,14 +259,28 @@ const NEXT_FILTER: Record<FilterMode, FilterMode> = {
 	idle: 'all',
 };
 
-function DashboardView({workerRepo, approvalRepo, onAction}: DashboardProps) {
+interface DaemonStatus {
+	alive: boolean;
+	pid?: number;
+	workers?: number;
+}
+
+function DashboardView({workerRepo, onAction}: Omit<DashboardProps, 'approvalRepo'>) {
 	const {exit} = useApp();
 	const {stdout} = useStdout();
 	const [allWorkers, setAllWorkers] = useState<WorkerDisplay[]>([]);
 	const [filter, setFilter] = useState<FilterMode>('all');
-	const [approvalCount, setApprovalCount] = useState(0);
 	const [selectedIndex, setSelectedIndex] = useState(0);
 	const [time, setTime] = useState(new Date().toLocaleTimeString());
+	const [daemonStatus, setDaemonStatus] = useState<DaemonStatus>({alive: false});
+	const [approvals, setApprovals] = useState<PendingApproval[]>([]);
+	const [dismissedIds, setDismissedIds] = useState<Set<string>>(new Set());
+	const [activePaneSessionId, setActivePaneSessionId] = useState<string | null>(null);
+
+	const visibleApprovals = useMemo(
+		() => approvals.filter((a) => !dismissedIds.has(a.id)),
+		[approvals, dismissedIds],
+	);
 
 	const workers = useMemo(
 		() => allWorkers.filter((w) => FILTER_FN[filter](w.status)),
@@ -249,10 +304,11 @@ function DashboardView({workerRepo, approvalRepo, onAction}: DashboardProps) {
 
 	const visibleWorkers = workers.slice(viewport.start, viewport.end);
 
-	const refresh = useCallback(async () => {
-		const [raw, approvals] = await Promise.all([
+	const refreshWorkers = useCallback(async () => {
+		const [raw, daemon, leftPaneSid] = await Promise.all([
 			workerRepo.list(),
-			approvalRepo.list(),
+			pingDaemon(),
+			getLeftPaneSessionId(),
 		]);
 
 		const [livenessMap, missionTitles] = await Promise.all([
@@ -269,6 +325,7 @@ function DashboardView({workerRepo, approvalRepo, onAction}: DashboardProps) {
 				status: livenessMap.get(meta.name) ?? 'idle',
 				agent: meta.agent,
 				cwd: meta.cwd,
+				sessionId: sid,
 				shortSid,
 				pid: meta.process?.serve?.pid,
 			};
@@ -276,23 +333,86 @@ function DashboardView({workerRepo, approvalRepo, onAction}: DashboardProps) {
 
 		const sorted = sortByLiveness(enriched);
 		setAllWorkers(sorted);
-		setApprovalCount(approvals.length);
+		setDaemonStatus(daemon);
+		setActivePaneSessionId(leftPaneSid);
 		setSelectedIndex((prev) => Math.min(prev, Math.max(sorted.length - 1, 0)));
-	}, [workerRepo, approvalRepo]);
+	}, [workerRepo]);
+
+	const refreshApprovals = useCallback(async () => {
+		const r = await rpcCall({kind: 'approvals.list'});
+		if (r.ok && Array.isArray(r.data)) {
+			const approvalList = r.data as PendingApproval[];
+			setApprovals(approvalList);
+			setDismissedIds((prev) => {
+				const currentIds = new Set(approvalList.map((a) => a.id));
+				let changed = false;
+				for (const id of prev) {
+					if (!currentIds.has(id)) changed = true;
+				}
+				return changed ? new Set() : prev;
+			});
+		}
+	}, []);
 
 	useEffect(() => {
-		void refresh();
+		void refreshWorkers();
 		const timer = setInterval(() => {
-			void refresh();
+			void refreshWorkers();
 			setTime(new Date().toLocaleTimeString());
 		}, 2000);
 		return () => clearInterval(timer);
-	}, [refresh]);
+	}, [refreshWorkers]);
 
-	const fire = useCallback((action: DashboardAction) => {
-		onAction(action);
-		exit();
-	}, [onAction, exit]);
+	useEffect(() => {
+		void refreshApprovals();
+		const timer = setInterval(() => {
+			void refreshApprovals();
+		}, 500);
+		return () => clearInterval(timer);
+	}, [refreshApprovals]);
+
+	const handleApproval = useCallback(
+		(kind: 'approve' | 'reject', ids: string[]) => {
+			setDismissedIds((prev) => {
+				const next = new Set(prev);
+				for (const id of ids) next.add(id);
+				return next;
+			});
+			for (const id of ids) {
+				rpcCall({
+					kind: 'approvals.reply',
+					id,
+					reply: kind === 'approve' ? 'once' : 'reject',
+					...(kind === 'reject' ? {message: 'rejected by orchestrator'} : {}),
+				}).catch(() => {});
+			}
+		},
+		[],
+	);
+
+	const fire = useCallback(
+		(action: DashboardAction) => {
+			if (action.kind === 'approve') {
+				handleApproval('approve', [action.id]);
+				return;
+			}
+			if (action.kind === 'reject') {
+				handleApproval('reject', [action.id]);
+				return;
+			}
+			if (action.kind === 'approve-all') {
+				handleApproval('approve', visibleApprovals.map((a) => a.id));
+				return;
+			}
+			if (action.kind === 'reject-all') {
+				handleApproval('reject', visibleApprovals.map((a) => a.id));
+				return;
+			}
+			onAction(action);
+			exit();
+		},
+		[onAction, exit, handleApproval, visibleApprovals],
+	);
 
 	useInput((_input, key) => {
 		if (key.tab) {
@@ -308,23 +428,61 @@ function DashboardView({workerRepo, approvalRepo, onAction}: DashboardProps) {
 			if (worker) {
 				fire({kind: 'worker', name: worker.name});
 			}
+		} else if (key.escape || _input === 'o') {
+			fire({kind: 'back'});
 		} else if (_input === 's') {
 			fire({kind: 'shutdown'});
 		} else if (key.ctrl && _input === 'c') {
 			fire({kind: 'quit'});
+		} else if (_input === 'a') {
+			if (visibleApprovals.length > 0) {
+				const a = visibleApprovals[0];
+				if (a) fire({kind: 'approve', id: a.id});
+			}
+		} else if (_input === 'r') {
+			if (visibleApprovals.length > 0) {
+				const a = visibleApprovals[0];
+				if (a) fire({kind: 'reject', id: a.id});
+			}
+		} else if (_input === 'A') {
+			if (visibleApprovals.length > 0) fire({kind: 'approve-all'});
+		} else if (_input === 'R') {
+			if (visibleApprovals.length > 0) fire({kind: 'reject-all'});
 		}
 	});
 
 	useMouse((event) => {
 		if (event.action !== 'press' || event.button !== 0) return;
-		const row = event.y - 2;
-		if (row < 0 || row >= visibleWorkers.length) return;
-		const clickedIndex = viewport.start + row;
-		if (clickedIndex === selectedIndex) {
-			const worker = workers[clickedIndex];
-			if (worker) fire({kind: 'worker', name: worker.name});
-		} else {
-			setSelectedIndex(clickedIndex);
+		const headerEnd = 2;
+		const workerAreaEnd = headerEnd + visibleWorkers.length;
+		const approvalRow = event.y - headerEnd;
+
+		if (event.y >= headerEnd && event.y < workerAreaEnd) {
+			const clickedIndex = viewport.start + approvalRow;
+			if (clickedIndex === selectedIndex) {
+				const worker = workers[clickedIndex];
+				if (worker) fire({kind: 'worker', name: worker.name});
+			} else {
+				setSelectedIndex(clickedIndex);
+			}
+			return;
+		}
+
+		if (visibleApprovals.length > 0) {
+			const approvalListEnd = workerAreaEnd + Math.min(visibleApprovals.length, 3);
+			const buttonRow = approvalListEnd;
+			if (event.y === buttonRow) {
+				if (event.x <= 12) {
+					const a = visibleApprovals[0];
+					if (a) fire({kind: 'approve', id: a.id});
+					return;
+				}
+				if (event.x > 12 && event.x <= 24) {
+					const a = visibleApprovals[0];
+					if (a) fire({kind: 'reject', id: a.id});
+					return;
+				}
+			}
 		}
 	});
 
@@ -337,6 +495,14 @@ function DashboardView({workerRepo, approvalRepo, onAction}: DashboardProps) {
 				<Text backgroundColor="gray" color="white">
 					{` ${FILTER_LABEL[filter]}(${workers.length}) `}
 				</Text>
+				<Text> </Text>
+				{daemonStatus.alive ? (
+					<Text color="green">
+						{`daemon:up pid=${daemonStatus.pid} port=${getServerPort()}`}
+					</Text>
+				) : (
+					<Text color="red">daemon:DOWN</Text>
+				)}
 			</Box>
 
 			<Box flexDirection="column" flexGrow={1}>
@@ -350,17 +516,39 @@ function DashboardView({workerRepo, approvalRepo, onAction}: DashboardProps) {
 								key={w.name}
 								worker={w}
 								selected={i === selectedIndex}
+								isCurrent={w.sessionId !== '' && w.sessionId === activePaneSessionId}
 							/>
 						);
 					})
 				)}
 			</Box>
 
-			<Box>
-				{approvalCount > 0 ? (
-					<Text color="yellow">
-						⚠ {approvalCount} pending approval{approvalCount > 1 ? 's' : ''}
-					</Text>
+			<Box flexDirection="column">
+				{visibleApprovals.length > 0 ? (
+					<>
+						{visibleApprovals.slice(0, 3).map((a) => {
+							const toolName = (a.metadata as Record<string, unknown>)?.tool_name ?? '?';
+							const patterns = a.patterns.length > 0 ? a.patterns[0] : '';
+							const shortPatterns = typeof patterns === 'string' && patterns.length > 60
+								? patterns.slice(0, 57) + '...'
+								: patterns;
+							return (
+								<Box key={a.id}>
+									<Text color="yellow" bold>{'⚠ '}</Text>
+									<Text color="yellow">{a.worker}</Text>
+									<Text dimColor>{` ${toolName} `}</Text>
+									<Text>{shortPatterns}</Text>
+								</Box>
+							);
+						})}
+						<Box>
+							<Text color="green" bold>{' [✓ approve] '}</Text>
+							<Text color="red" bold>{' [✗ reject] '}</Text>
+							{visibleApprovals.length > 1 ? (
+								<Text dimColor>{`(${visibleApprovals.length} pending · A/R for all)`}</Text>
+							) : null}
+						</Box>
+					</>
 				) : (
 					<Text color="green">✓ no pending approvals</Text>
 				)}
@@ -375,7 +563,7 @@ function DashboardView({workerRepo, approvalRepo, onAction}: DashboardProps) {
 			<Box>
 				<Text dimColor>
 					{' '}
-					{time} | {workers.length}w | Tab filter · ↑↓·Enter·click · s shutdown · ⌘C
+					{time} | {workers.length}w | Tab·↑↓·Enter·click · o back · a/r approve/reject · A/R all · s shutdown · ⌘C
 				</Text>
 			</Box>
 		</Box>
@@ -384,11 +572,9 @@ function DashboardView({workerRepo, approvalRepo, onAction}: DashboardProps) {
 
 export class Dashboard {
 	private readonly workerRepo: WorkerRepository;
-	private readonly approvalRepo: ApprovalRepository;
 
-	constructor(workerRepo: WorkerRepository, approvalRepo: ApprovalRepository) {
+	constructor(workerRepo: WorkerRepository, _approvalRepo: ApprovalRepository) {
 		this.workerRepo = workerRepo;
-		this.approvalRepo = approvalRepo;
 	}
 
 	async show(): Promise<DashboardAction> {
@@ -406,7 +592,6 @@ export class Dashboard {
 			const instance = render(
 				<DashboardView
 					workerRepo={this.workerRepo}
-					approvalRepo={this.approvalRepo}
 					onAction={onAction}
 				/>,
 			);
@@ -415,42 +600,125 @@ export class Dashboard {
 	}
 }
 
-async function resolveWorkerCommand(
-	name: string,
-	workerRepo: WorkerRepository,
-): Promise<{cmd: string; cwd: string} | null> {
-	const meta = await workerRepo.read(name).catch(() => null);
-	if (!meta) return null;
-
+function attachCommand(meta: WorkerMeta): string | undefined {
 	if (meta.agent === 'opencode') {
 		const url = meta.process?.serve?.serverUrl;
-		if (!url || !meta.sessionId) return null;
-		return {cmd: `opencode attach ${url} --session ${meta.sessionId}`, cwd: meta.cwd};
+		if (url && meta.sessionId) {
+			return `opencode attach ${url} --session ${meta.sessionId}`;
+		}
 	}
-
 	if (meta.agent === 'claude') {
-		const cmd = meta.sessionId ? `claude --resume ${meta.sessionId}` : 'claude';
-		return {cmd, cwd: meta.cwd};
+		return meta.sessionId ? `claude --resume ${meta.sessionId}` : 'claude';
 	}
+	return undefined;
+}
 
+async function inferUrlFromPid(pid: number): Promise<string | undefined> {
+	try {
+		const {stdout} = await execFileAsync('lsof', ['-i', 'TCP', '-s', 'TCP:LISTEN', '-P', '-n', '-p', String(pid)]);
+		const match = stdout.match(/127\.0\.0\.1:(\d+)/);
+		if (match) return `http://127.0.0.1:${match[1]}`;
+	} catch {}
+	return undefined;
+}
+
+async function getLeftPaneCwd(): Promise<string | null> {
+	const child = await getLeftPaneChildCommand();
+	if (!child) return null;
+	try {
+		const {stdout} = await execFileAsync('lsof', ['-p', String(child.pid), '-Fn']);
+		for (const line of stdout.split('\n')) {
+			if (line.startsWith('n/') && !line.includes('/opt/homebrew') && !line.includes('/Library/')) {
+				return line.slice(1);
+			}
+		}
+	} catch {}
 	return null;
 }
 
-function spawnTUI(command: string, cwd: string): Promise<void> {
-	return new Promise((resolve) => {
-		const child = spawn('sh', ['-c', command], {cwd, stdio: 'inherit'});
-		child.on('exit', () => resolve());
-		child.on('error', () => resolve());
-	});
+async function switchToWorker(meta: WorkerMeta): Promise<void> {
+	const leftPaneSid = await getLeftPaneSessionId();
+	if (meta.sessionId && meta.sessionId === leftPaneSid) {
+		logger.info('switchToWorker skipped: already in left pane', {name: meta.name, sessionId: meta.sessionId});
+		return;
+	}
+
+	const child = await getLeftPaneChildCommand();
+	if (child) {
+		const isBare = /^(?:\S+\/)?opencode(?:\s|$)/.test(child.cmd) && !child.cmd.includes('attach') && !child.cmd.includes('serve');
+		if (isBare) {
+			const paneCwd = await getLeftPaneCwd();
+			if (paneCwd === meta.cwd) {
+				logger.info('switchToWorker skipped: bare TUI already in this project', {name: meta.name, cwd: meta.cwd});
+				return;
+			}
+		}
+	}
+
+	let cmd = attachCommand(meta);
+	logger.info('switchToWorker', {name: meta.name, agent: meta.agent, hasUrl: !!meta.process?.serve?.serverUrl, sessionId: meta.sessionId ?? 'null'});
+
+	if (!cmd && meta.agent === 'opencode') {
+		const servePid = meta.process?.serve?.pid;
+		if (servePid && isProcessAlive(servePid)) {
+			logger.info('serve process alive but no URL in metadata, inferring from lsof', {servePid});
+			const url = await inferUrlFromPid(servePid);
+			if (url && meta.sessionId) {
+				cmd = `opencode attach ${url} --session ${meta.sessionId}`;
+				await workerRepo.update(meta.name, (m) => ({...m, process: {...m.process, serve: {...m.process?.serve, serverUrl: url}}} as any));
+				logger.info('inferred URL from lsof', {url});
+			}
+		}
+	}
+
+	if (!cmd && meta.agent === 'opencode' && meta.sessionId) {
+		logger.info('starting resumeServe for idle worker');
+		const adapter = getAdapter('opencode') as any;
+		const {ensureServerUp} = await import('../../application/orchestration/commands/utils.js');
+		const result = await adapter.resumeServe({
+			workerName: meta.name,
+			cwdAbs: meta.cwd,
+			workbossServerUrl: await ensureServerUp(),
+		});
+		const serve = {pid: result.pid, serverUrl: result.serverUrl, serverPort: result.serverPort, startedAt: new Date().toISOString()};
+		await workerRepo.update(meta.name, (m) => ({...m, process: {...m.process, serve}} as any));
+		cmd = `opencode attach ${result.serverUrl} --session ${meta.sessionId}`;
+		logger.info('resumeServe done, using old sessionId', {url: result.serverUrl, sessionId: meta.sessionId});
+	}
+
+	if (cmd) {
+		logger.info('runInLeftPane', {cmd});
+		await runInLeftPane(cmd);
+		logger.info('runInLeftPane done');
+	} else {
+		logger.warn('could not construct command for worker', {name: meta.name});
+	}
 }
 
+async function switchToOrchestrator(): Promise<void> {
+	let state: {agent: string; cwd: string} | null = null;
+	try {
+		const raw = await fs.readFile(ORCHESTRATOR_STATE_FILE, 'utf8');
+		state = JSON.parse(raw);
+	} catch {}
+	if (!state) {
+		logger.warn('no orchestrator state file found');
+		return;
+	}
+	const cmd = state.agent === 'claude' ? 'claude' : 'opencode';
+	logger.info('switchToOrchestrator', {agent: state.agent});
+	await runInLeftPane(cmd);
+}
+
+const workerRepo = new FsWorkerRepository();
+
 export async function runDashboardLoop(): Promise<void> {
-	const workerRepo = new FsWorkerRepository();
 	const approvalRepo = new FsApprovalRepository();
 	const dashboard = new Dashboard(workerRepo, approvalRepo);
 
 	while (true) {
 		const action = await dashboard.show();
+		logger.info('action', action);
 
 		if (action.kind === 'quit') break;
 
@@ -463,8 +731,12 @@ export async function runDashboardLoop(): Promise<void> {
 		}
 
 		if (action.kind === 'worker') {
-			const resolved = await resolveWorkerCommand(action.name, workerRepo);
-			if (resolved) await spawnTUI(resolved.cmd, resolved.cwd);
+			const meta = await workerRepo.read(action.name).catch(() => null);
+			if (meta) await switchToWorker(meta);
+		}
+
+		if (action.kind === 'back') {
+			await switchToOrchestrator();
 		}
 	}
 }

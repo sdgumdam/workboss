@@ -5,11 +5,9 @@ import {pickUniqueName} from '../../presentation/format.js';
 import {getAdapter} from '../orchestration/agents/index.js';
 import {discoverAll, type DiscoveredSession} from '../orchestration/session-scanner.js';
 import type {LivenessWatcher} from './liveness-watcher.js';
+import {createLogger} from '../../infrastructure/logging/logger.js';
 
-function log(...args: unknown[]): void {
-  const ts = new Date().toISOString();
-  console.log(`[${ts}]`, ...args);
-}
+const logger = createLogger('patrol');
 
 function nameForDiscovered(d: DiscoveredSession): string {
   if (d.sessionId) return `auto-${d.sessionId.replace(/^ses_/, '').slice(0, 8)}`;
@@ -39,7 +37,7 @@ async function adoptDiscoveredWorker(
       workbossServerUrl: workbossUrl,
     });
   } catch (err) {
-    log(`adopt ${name}: prepareCwdMinimal failed: ${String(err)}`);
+    logger.info(`adopt ${name}: prepareCwdMinimal failed: ${String(err)}`);
     return;
   }
 
@@ -62,7 +60,7 @@ async function adoptDiscoveredWorker(
     notes: 'auto-adopted',
   });
   await repo.write(meta);
-  log(`adopted ${name}  ${d.agent}  ${d.sessionId}  ${d.cwd}`);
+  logger.info(`adopted ${name}  ${d.agent}  ${d.sessionId}  ${d.cwd}`);
 }
 
 export class WorkerPatrol {

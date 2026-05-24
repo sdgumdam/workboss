@@ -1,4 +1,4 @@
-import {readServerPort, FsApprovalRepository} from '../../../infrastructure/filesystem/approval-repo.js';
+import {FsApprovalRepository} from '../../../infrastructure/filesystem/approval-repo.js';
 import {rpcCall} from '../../../infrastructure/http/server-rpc.js';
 
 import {ok, fail} from './utils.js';
@@ -21,12 +21,13 @@ function formatApprovalRow(a: ApprovalRow): string {
 }
 
 export async function approvalsList(): Promise<void> {
-	const serverUp = (await readServerPort()) !== null;
+	const r = await rpcCall({kind: 'ping'});
+	const serverUp = r.ok;
 	const list = serverUp
 		? await (async () => {
-				const r = await rpcCall({kind: 'approvals.list'});
-				if (!r.ok) fail(r.error);
-				return (r.data ?? []) as ApprovalRow[];
+				const ar = await rpcCall({kind: 'approvals.list'});
+				if (!ar.ok) fail(ar.error);
+				return (ar.data ?? []) as ApprovalRow[];
 			})()
 		: ((await approvalRepo.list()) as ApprovalRow[]);
 

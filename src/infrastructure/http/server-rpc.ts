@@ -1,10 +1,4 @@
-/**
- * RPC client used by the workboss CLI to talk to the running aggregator
- * daemon. The daemon exposes an HTTP server on a random local port; we POST
- * a JSON request to /rpc and parse the JSON response.
- */
-
-import {readServerPort} from '../filesystem/approval-repo.js';
+import {getServerPort} from '../filesystem/paths.js';
 
 export type RpcRequest =
 	| {kind: 'ping'}
@@ -23,14 +17,7 @@ export type RpcResponse =
 	| {ok: false; error: string};
 
 export async function rpcCall(req: RpcRequest): Promise<RpcResponse> {
-	const port = await readServerPort();
-	if (port === null) {
-		return {
-			ok: false,
-			error:
-				'workboss server is not running. Start it with `workboss server start`.',
-		};
-	}
+	const port = getServerPort();
 	try {
 		const res = await fetch(`http://127.0.0.1:${port}/rpc`, {
 			method: 'POST',
@@ -42,7 +29,7 @@ export async function rpcCall(req: RpcRequest): Promise<RpcResponse> {
 	} catch (err) {
 		return {
 			ok: false,
-			error: `cannot reach workboss server on ${port}: ${err instanceof Error ? err.message : String(err)}`,
+			error: `cannot reach workboss server on port ${port}: ${err instanceof Error ? err.message : String(err)}`,
 		};
 	}
 }

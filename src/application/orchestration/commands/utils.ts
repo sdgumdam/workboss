@@ -3,7 +3,7 @@ import {promises as fs} from 'fs';
 
 import type {WorkerMeta} from '../../../domain/worker.js';
 import {FsWorkerRepository} from '../../../infrastructure/filesystem/worker-repo.js';
-import {readServerPort} from '../../../infrastructure/filesystem/approval-repo.js';
+import {getServerUrl} from '../../../infrastructure/filesystem/paths.js';
 import {workerDir, workerInboxPath, workerMissionPath} from '../../../infrastructure/filesystem/paths.js';
 import {renderMissionFile} from '../../../presentation/templates/templates.js';
 import {rpcCall} from '../../../infrastructure/http/server-rpc.js';
@@ -30,12 +30,12 @@ export async function loadWorker(name: string): Promise<WorkerMeta> {
 }
 
 export async function ensureServerUp(): Promise<string> {
-	const port = await readServerPort();
-	if (port !== null) return `http://127.0.0.1:${port}`;
+	const r = await rpcCall({kind: 'ping'});
+	if (r.ok) return getServerUrl();
 	await serverStart();
-	const after = await readServerPort();
-	if (after === null) fail('failed to auto-start workboss server');
-	return `http://127.0.0.1:${after}`;
+	const after = await rpcCall({kind: 'ping'});
+	if (!after.ok) fail('failed to auto-start workboss server');
+	return getServerUrl();
 }
 
 export async function createWorkerScaffold(
