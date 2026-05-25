@@ -6,6 +6,7 @@ import {getAdapter} from '../orchestration/agents/index.js';
 import {discoverAll, type DiscoveredSession} from '../orchestration/session-scanner.js';
 import type {LivenessWatcher} from './liveness-watcher.js';
 import {createLogger} from '../../infrastructure/logging/logger.js';
+import {rpcCall} from '../../infrastructure/http/server-rpc.js';
 
 const logger = createLogger('patrol');
 
@@ -61,6 +62,11 @@ async function adoptDiscoveredWorker(
   });
   await repo.write(meta);
   logger.info(`adopted ${name}  ${d.agent}  ${d.sessionId}  ${d.cwd}`);
+
+  const attachResult = await rpcCall({kind: 'workers.attach', name});
+  if (!attachResult.ok) {
+    logger.info(`adopt ${name}: workers.attach failed: ${attachResult.error}`);
+  }
 }
 
 export class WorkerPatrol {
