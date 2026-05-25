@@ -661,6 +661,104 @@ rm -rf /tmp/wb-test-detach
 
 ---
 
+## T25: Patrol Adopt — Worker Registered in Daemon Registry
+
+### 为什么有这个 case
+Bug 历史：`adoptDiscoveredWorker()` 写了磁盘但没通知 daemon 注册到内存 registry。
+导致 auto-adopted worker 的 hook 请求被 daemon 拒绝（返回 ask 而非 allow）。
+**所有之前的 E2E 测试都用了手动 register 的 worker（有 notifyAggregator），从未覆盖 patrol adopt 路径。**
+
+### 前置
+- daemon 运行中
+- 有至少 1 个 claude 进程在跑（workboss 外部启动的）
+
+### 步骤
+1. 重启 daemon（清空内存 registry，然后从磁盘重建）
+2. 等待 patrol sweep（或手动触发 `node bin/workboss.js discover --register-alive`）
+3. 取一个 auto-adopted claude worker name
+4. `curl -s -X POST "http://127.0.0.1:58212/claude-hook/<worker-name>" -d '{"session_id":"test","tool_name":"Read","tool_input":{"file_path":"/tmp/test"}}'`
+
+### 预期
+- step 4 返回 `permissionDecision: "allow"`
+- **不**返回 `permissionDecision: "ask"` + `"workboss does not know worker"`
+
+### 验收命令
+```bash
+# 方法 1：重启 daemon 后验证所有 claude worker 的 hook
+node bin/workboss.js server restart >/dev/null 2>&1
+sleep 3
+CLAUDE_WORKER=$(node bin/workboss.js list 2>&1 | grep 'up.*claude' | head -1 | awk '{print $2}')
+if [ -z "$CLAUDE_WORKER" ]; then echo "T25 SKIP: no alive claude worker"; exit 0; fi
+RESULT=$(curl -sf -X POST "http://127.0.0.1:58212/claude-hook/${CLAUDE_WORKER}" -H 'Content-Type: application/json' -d '{"session_id":"t","tool_name":"Read","tool_input":{"file_path":"/t"}}')
+echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['hookSpecificOutput']['permissionDecision']=='allow', f'got {d}'; print('T25 PASS')" || echo "T25 FAIL: $RESULT"
+```
+
+### 方法 2：spawn + 等待 patrol（更完整的验证）
+```bash
+# 1. 启动一个 opencode serve（模拟外部进程）
+mkdir -p /tmp/wb-patrol-test
+opencode serve --port 19999 &
+SERVE_PID=$!
+sleep 2
+
+# 2. 重启 daemon，让 patrol 发现这个进程
+node bin/workboss.js server restart >/dev/null 2>&1
+sleep 65  # 等待 patrol sweep（60s 间隔）
+
+# 3. 找到被 adopt 的 worker
+PATROL_WORKER=$(node bin/workboss.js list 2>&1 | grep '19999' | awk '{print $2}')
+
+# 4. 验证 daemon registry 包含这个 worker
+REG_COUNT=$(curl -sf -X POST http://127.0.0.1:58212/rpc -H 'Content-Type: application/json' -d '{"kind":"ping"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['workers'])")
+echo "Registered workers: $REG_COUNT"
+[ -n "$PATROL_WORKER" ] && echo "T25 PASS: patrol adopted $PATROL_WORKER" || echo "T25 CHECK: worker not adopted yet"
+
+# cleanup
+kill $SERVE_PID 2>/dev/null; node bin/workboss.js remove "$PATROL_WORKER" 2>/dev/null; rm -rf /tmp/wb-patrol-test
+```
+
+---
+
+## T26: Hook Path Consistency — settings.local.json Worker Name Matches Registry
+
+### 为什么有这个 case
+Bug 历史：多个 claude worker 共享同一个 cwd 时，`settings.local.json` 只有 1 份，
+最后写入的 worker URL 覆盖前面的。导致 worker A 的 hook 被路由到 worker B。
+
+### 前置
+- 存在 2+ 个 claude worker 共享同一个 cwd
+
+### 步骤
+1. 找到共享 cwd 的 worker 组
+2. 读 `.claude/settings.local.json`，提取 hook URL 里的 worker name
+3. 验证该 worker name 在 daemon registry 里
+4. 验证该 worker name 是该 cwd 下唯一 alive 的 worker
+
+### 验收命令
+```bash
+# 找共享 cwd 的 claude worker 组
+SHARED_CWD=$(node bin/workboss.js list 2>&1 | grep 'up.*claude' | awk '{print $NF}' | sort | uniq -c | sort -rn | head -1 | awk '{print $2}')
+if [ -z "$SHARED_CWD" ]; then echo "T26 SKIP: no shared cwd"; exit 0; fi
+
+# 读 settings.local.json 里的 hook URL
+HOOK_WORKER=$(python3 -c "
+import json
+with open('${SHARED_CWD}/.claude/settings.local.json') as f:
+    d = json.load(f)
+hooks = d.get('hooks', {}).get('PreToolUse', [])
+for h in hooks:
+    for hook in h.get('hooks', []):
+        url = hook.get('url', '')
+        if 'claude-hook/' in url:
+            print(url.split('claude-hook/')[-1])
+")
+
+# 验证 hook URL 里的 worker 存在于 list
+node bin/workboss.js list 2>&1 | grep -q "$HOOK_WORKER" && echo "T26 PASS: hook worker $HOOK_WORKER exists" || echo "T26 FAIL: hook worker $HOOK_WORKER NOT FOUND in list"
+```
+
+---
+
 ## 附录：一键回归脚本
 
 ```bash
