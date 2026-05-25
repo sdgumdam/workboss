@@ -139,9 +139,16 @@ export async function sendKeys(target: string, command: string): Promise<void> {
 	await run(['send-keys', '-t', target, command, 'Enter']);
 }
 
+type BareTUIDetector = (cmd: string) => boolean;
+
+let bareTUIDetector: BareTUIDetector = () => false;
+
+export function registerBareTUIDetector(detector: BareTUIDetector): void {
+	bareTUIDetector = detector;
+}
+
 function isBareTUI(cmd: string): boolean {
-	const base = cmd.trim();
-	return /^(?:\S+\/)?opencode(?:\s|$)/.test(base) && !base.includes('attach') && !base.includes('serve');
+	return bareTUIDetector(cmd);
 }
 
 export async function getLeftPaneChildCommand(): Promise<{pid: number; cmd: string} | null> {
@@ -154,7 +161,9 @@ export async function getLeftPaneChildCommand(): Promise<{pid: number; cmd: stri
 		const {stdout: children} = await execFileAsync('pgrep', ['-P', String(shellPid)]);
 		const childPids = children.trim().split('\n').filter(Boolean);
 		if (childPids.length === 0) return null;
-		const pid = parseInt(childPids[0]!, 10);
+		const firstChild = childPids[0];
+		if (!firstChild) return null;
+		const pid = parseInt(firstChild, 10);
 		const {stdout: cmd} = await execFileAsync('ps', ['-p', String(pid), '-o', 'command=']);
 		return {pid, cmd: cmd.trim()};
 	} catch {

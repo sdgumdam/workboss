@@ -9,8 +9,33 @@
  * each time we support a new runtime.
  */
 
+import type {IncomingMessage, ServerResponse} from 'http';
 import type {AgentKind, LivenessResult, WorkerMeta} from '../../../domain/worker.js';
 import type {PendingApproval, ReplyKind} from '../../../domain/approval.js';
+
+// ---------- classified process ----------
+
+export interface ClassifiedProcess {
+	pid: number;
+	agent: AgentKind;
+	port?: number;
+	sessionId?: string;
+	isAttachClient?: boolean;
+}
+
+// ---------- discovered session (re-exported from scanner) ----------
+
+export interface DiscoveredSession {
+	agent: AgentKind;
+	cwd?: string;
+	sessionId?: string;
+	serverUrl?: string;
+	pid?: number;
+	alive: boolean;
+	lastActivity?: Date;
+	title?: string;
+	messageCount?: number;
+}
 
 // ---------- spawn ----------
 
@@ -84,6 +109,26 @@ export interface SubscribeArgs {
 
 // ---------- liveness (status codes defined in lib/types.ts) ----------
 
+// ---------- resume serve ----------
+
+export interface ResumeServeResult {
+	pid: number;
+	serverUrl: string;
+	serverPort: number;
+}
+
+// ---------- hook context ----------
+
+export interface HookContext {
+	workerRepo: {
+		update: (name: string, patch: (m: WorkerMeta) => WorkerMeta | Promise<WorkerMeta>) => Promise<WorkerMeta | null>;
+	};
+	approvalRepo: {
+		write: (a: PendingApproval) => Promise<void>;
+		delete: (id: string) => Promise<void>;
+	};
+}
+
 // ---------- adapter ----------
 
 export interface AgentAdapter {
@@ -155,4 +200,35 @@ export interface AgentAdapter {
 	 * this — those arrive on the workboss HTTP server instead.
 	 */
 	subscribe?(args: SubscribeArgs): void;
+
+	// ---------- identity ----------
+
+	getIcon(): string;
+	getDisplayName(): string;
+	getBinaryName(): string;
+	getBootstrapDocName(): 'AGENTS.md' | 'CLAUDE.md';
+
+	// ---------- command construction ----------
+
+	getLaunchCommand(opts: {prompt?: string}): string;
+	getPostLaunchHint(): string[];
+	isBareTUICommand(cmd: string): boolean;
+	isOurProcess(cmd: string): boolean;
+	buildAttachCommand(meta: WorkerMeta): string | undefined;
+	resumeAndAttach(meta: WorkerMeta, serverUrl: string): Promise<string | undefined>;
+	getRestartInstructions(meta: WorkerMeta): string[];
+
+	// ---------- daemon integration ----------
+
+	refreshDaemonSettings(meta: WorkerMeta, serverUrl: string): Promise<void>;
+	handleHookRequest?(req: IncomingMessage, res: ServerResponse, workerName: string): Promise<void>;
+	shutdown(): Promise<void>;
+	setHookContext?(ctx: HookContext): void;
+
+	// ---------- session discovery ----------
+
+	classifyPsLine(line: string): ClassifiedProcess | null;
+	findSessionIdByCwd(cwd: string): Promise<string | undefined>;
+	findHistoricalSessions(): Promise<DiscoveredSession[]>;
+	enrichAliveSession(hit: ClassifiedProcess, cwd: string): Promise<DiscoveredSession>;
 }

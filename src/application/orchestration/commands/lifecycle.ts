@@ -61,26 +61,6 @@ async function gracefulKill(pid: number, graceMs = 2000): Promise<void> {
 	}
 }
 
-async function respawnOpenCodeServe(
-	name: string,
-	meta: WorkerMeta,
-): Promise<string | undefined> {
-	if (!meta.sessionId) return undefined;
-	const adapter = getAdapter('opencode');
-	const result = await adapter.spawnNew({
-		workerName: name,
-		cwdAbs: meta.cwd,
-		missionBody: '',
-		workbossServerUrl: (await ensureServerUp()),
-	});
-	await workerRepo.update(name, (m: WorkerMeta) => ({...m, process: {serve: result.process}}));
-	await notifyAggregator(name);
-	if (result.process?.serverUrl && meta.sessionId) {
-		return `opencode attach ${result.process.serverUrl} --session ${meta.sessionId}`;
-	}
-	return undefined;
-}
-
 export async function registerWorker(args: RegisterArgs): Promise<void> {
 	ensureRoot();
 	const adapter = getAdapter(args.agent);
@@ -118,29 +98,18 @@ export async function registerWorker(args: RegisterArgs): Promise<void> {
 
 export async function attachWorker(name: string): Promise<void> {
 	const meta = await loadWorker(name);
+	const adapter = getAdapter(meta.agent);
+
 	if (await workbossSessionExists()) {
 		try {
 			await selectWindow(name);
 			ok(`switched to window "${name}"`);
 			return;
 		} catch {
-			// Window was killed by detach — recreate it.
 		}
 
-		let tuiCmd: string | undefined;
-		if (meta.agent === 'opencode') {
-			const url = meta.process?.serve?.serverUrl;
-			if (url && meta.sessionId) {
-				tuiCmd = `opencode attach ${url} --session ${meta.sessionId}`;
-			}
-			if (!tuiCmd) {
-				tuiCmd = await respawnOpenCodeServe(name, meta);
-			}
-		} else if (meta.agent === 'claude') {
-			tuiCmd = meta.sessionId
-				? `claude --resume ${meta.sessionId}`
-				: 'claude';
-		}
+		const serverUrl = await ensureServerUp();
+		const tuiCmd = await adapter.resumeAndAttach(meta, serverUrl);
 
 		if (tuiCmd) {
 			await createWorkerWindow(name, tuiCmd, meta.cwd);
@@ -155,7 +124,7 @@ export async function attachWorker(name: string): Promise<void> {
 			return;
 		}
 	}
-	for (const line of getAdapter(meta.agent).attachHint(meta)) ok(line);
+	for (const line of adapter.attachHint(meta)) ok(line);
 }
 
 export async function detachWorker(name: string): Promise<void> {

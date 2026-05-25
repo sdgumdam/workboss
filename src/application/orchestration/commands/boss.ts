@@ -14,6 +14,8 @@ import {
 	CliTmuxClient,
 } from '../../../infrastructure/tmux/tmux.js';
 
+import {getAdapter} from '../agents/index.js';
+import type {AgentKind} from '../../../domain/worker.js';
 import {ok, ensureServerUp} from './utils.js';
 import {ORCHESTRATOR_STATE_FILE} from '../../../infrastructure/filesystem/paths.js';
 
@@ -31,17 +33,21 @@ const ORCHESTRATOR_TEMPLATE = path.join(
 
 const SUPERVISOR_HOME = path.join(os.homedir(), '.workboss', 'supervisor');
 
+const BOOT_SCAN_PROMPT =
+	'按 AGENTS.md 的"开机自检"段做一次：把机器上所有活着的 worker 和当前待审批用一段话扫完的格式汇报给我。然后等我下一步指令。';
+
 export async function bossCmd(args: {
-	agent?: 'opencode' | 'claude';
+	agent?: AgentKind;
 }): Promise<void> {
 	await ensureServerUp();
 
 	await fs.mkdir(SUPERVISOR_HOME, {recursive: true, mode: 0o700});
-	const agent = args.agent ?? 'opencode';
-	const docName = agent === 'claude' ? 'CLAUDE.md' : 'AGENTS.md';
+	const agentKind: AgentKind = args.agent ?? 'opencode';
+	const adapter = getAdapter(agentKind);
+
 	const promptContent = await fs.readFile(ORCHESTRATOR_TEMPLATE, 'utf8');
 	await fs.writeFile(
-		path.join(SUPERVISOR_HOME, docName),
+		path.join(SUPERVISOR_HOME, adapter.getBootstrapDocName()),
 		promptContent,
 		'utf8',
 	);
@@ -55,26 +61,18 @@ export async function bossCmd(args: {
 			await tmux.createSplitLayout(SUPERVISOR_HOME);
 		}
 
-		const bootScan =
-			'按 AGENTS.md 的"开机自检"段做一次：把机器上所有活着的 worker 和当前待审批用一段话扫完的格式汇报给我。然后等我下一步指令。';
-
-		let cmd: string;
-		if (agent === 'opencode') {
-			cmd = `opencode --prompt '${bootScan}'`;
-		} else {
-			cmd = 'claude';
-		}
+		const cmd = adapter.getLaunchCommand({prompt: BOOT_SCAN_PROMPT});
 
 		await sendKeys(LEFT_PANE, cmd);
 		await sendKeys(RIGHT_PANE, 'workboss dashboard');
 
 		await fs.writeFile(
 			ORCHESTRATOR_STATE_FILE,
-			JSON.stringify({agent, cwd: SUPERVISOR_HOME}),
+			JSON.stringify({agent: agentKind, cwd: SUPERVISOR_HOME}),
 			'utf8',
 		);
 
-		ok(`workboss boss: launching ${agent} in tmux session "${WORKBOSS_SESSION}"`);
+		ok(`workboss boss: launching ${agentKind} in tmux session "${WORKBOSS_SESSION}"`);
 		ok(`  left pane : orchestrator`);
 		ok(`  right pane: dashboard`);
 		ok('');
@@ -99,21 +97,17 @@ export async function bossCmd(args: {
 		return;
 	}
 
-	ok(`workboss boss: launching ${agent} in ${SUPERVISOR_HOME}`);
+	ok(`workboss boss: launching ${agentKind} in ${SUPERVISOR_HOME}`);
 	ok('');
 
-	const bootScan =
-		'按 AGENTS.md 的"开机自检"段做一次：把机器上所有活着的 worker 和当前待审批用一段话扫完的格式汇报给我。然后等我下一步指令。';
-	const cliArgs =
-		agent === 'opencode' ? ['--prompt', bootScan] : [];
-	if (agent === 'claude') {
-		ok(
-			'(提示：claude 启动后第一句对它说"扫一遍"它就会自动跑 list+discover 汇报)',
-		);
-		ok('');
+	for (const hint of adapter.getPostLaunchHint()) {
+		ok(hint);
 	}
 
-	const child = spawn(agent, cliArgs, {
+	const cmd = adapter.getLaunchCommand({prompt: BOOT_SCAN_PROMPT});
+	const binaryName = adapter.getBinaryName();
+
+	const child = spawn(binaryName, cmd === binaryName ? [] : [cmd], {
 		cwd: SUPERVISOR_HOME,
 		stdio: 'inherit',
 	});
@@ -126,8 +120,8 @@ export async function bossCmd(args: {
 		child.on('error', err => {
 			reject(
 				new Error(
-					`failed to launch ${agent}: ${err.message}. ` +
-						`Is "${agent}" on your PATH?`,
+					`failed to launch ${binaryName}: ${err.message}. ` +
+						`Is "${binaryName}" on your PATH?`,
 				),
 			);
 		});

@@ -6,9 +6,8 @@ import {useState, useEffect, useCallback, useMemo, useRef} from 'react';
 import {render, Box, Text, useApp, useInput, useStdout} from 'ink';
 
 import type {LivenessStatus, WorkerMeta, WorkerRepository} from '../../domain/worker.js';
-import type {ApprovalRepository, PendingApproval} from '../../domain/approval.js';
+import type {PendingApproval} from '../../domain/approval.js';
 import {FsWorkerRepository} from '../../infrastructure/filesystem/worker-repo.js';
-import {FsApprovalRepository} from '../../infrastructure/filesystem/approval-repo.js';
 import {workerMissionPath, ORCHESTRATOR_STATE_FILE, getServerPort} from '../../infrastructure/filesystem/paths.js';
 import {getAdapter} from '../../application/orchestration/agents/index.js';
 import {findAliveAgents} from '../../application/orchestration/session-scanner.js';
@@ -18,7 +17,6 @@ import {
 	getLeftPaneChildCommand,
 } from '../../infrastructure/tmux/tmux.js';
 import {createLogger} from '../../infrastructure/logging/logger.js';
-import {isProcessAlive} from '../../infrastructure/process/process.js';
 import {pingDaemon} from '../../application/orchestration/commands/server.js';
 import {rpcCall} from '../../infrastructure/http/server-rpc.js';
 
@@ -37,11 +35,6 @@ const LIVENESS_COLOR: Record<LivenessStatus, string> = {
 	up: 'green', degraded: 'yellow', dead: 'red', idle: 'gray',
 };
 
-const AGENT_ICON: Record<string, string> = {
-	opencode: '⬡',
-	claude: '◈',
-};
-
 export type DashboardAction =
 	| {kind: 'worker'; name: string}
 	| {kind: 'back'}
@@ -54,7 +47,6 @@ export type DashboardAction =
 
 interface DashboardProps {
 	workerRepo: WorkerRepository;
-	approvalRepo: ApprovalRepository;
 	onAction: (action: DashboardAction) => void;
 }
 
@@ -220,7 +212,7 @@ function WorkerRow({worker, selected, isCurrent}: {
 }) {
 	const icon = LIVENESS_ICON[worker.status] ?? '○';
 	const color = LIVENESS_COLOR[worker.status] ?? 'gray';
-	const agentIcon = AGENT_ICON[worker.agent] ?? '?';
+	const agentIcon = getAdapter(worker.agent as 'opencode' | 'claude').getIcon();
 	const prefix = selected ? '▸' : ' ';
 
 	return (
@@ -265,7 +257,7 @@ interface DaemonStatus {
 	workers?: number;
 }
 
-function DashboardView({workerRepo, onAction}: Omit<DashboardProps, 'approvalRepo'>) {
+function DashboardView({workerRepo, onAction}: DashboardProps) {
 	const {exit} = useApp();
 	const {stdout} = useStdout();
 	const [allWorkers, setAllWorkers] = useState<WorkerDisplay[]>([]);
@@ -573,7 +565,7 @@ function DashboardView({workerRepo, onAction}: Omit<DashboardProps, 'approvalRep
 export class Dashboard {
 	private readonly workerRepo: WorkerRepository;
 
-	constructor(workerRepo: WorkerRepository, _approvalRepo: ApprovalRepository) {
+	constructor(workerRepo: WorkerRepository) {
 		this.workerRepo = workerRepo;
 	}
 
@@ -600,28 +592,6 @@ export class Dashboard {
 	}
 }
 
-function attachCommand(meta: WorkerMeta): string | undefined {
-	if (meta.agent === 'opencode') {
-		const url = meta.process?.serve?.serverUrl;
-		if (url && meta.sessionId) {
-			return `opencode attach ${url} --session ${meta.sessionId}`;
-		}
-	}
-	if (meta.agent === 'claude') {
-		return meta.sessionId ? `claude --resume ${meta.sessionId}` : 'claude';
-	}
-	return undefined;
-}
-
-async function inferUrlFromPid(pid: number): Promise<string | undefined> {
-	try {
-		const {stdout} = await execFileAsync('lsof', ['-i', 'TCP', '-s', 'TCP:LISTEN', '-P', '-n', '-p', String(pid)]);
-		const match = stdout.match(/127\.0\.0\.1:(\d+)/);
-		if (match) return `http://127.0.0.1:${match[1]}`;
-	} catch {}
-	return undefined;
-}
-
 async function getLeftPaneCwd(): Promise<string | null> {
 	const child = await getLeftPaneChildCommand();
 	if (!child) return null;
@@ -645,8 +615,8 @@ async function switchToWorker(meta: WorkerMeta): Promise<void> {
 
 	const child = await getLeftPaneChildCommand();
 	if (child) {
-		const isBare = /^(?:\S+\/)?opencode(?:\s|$)/.test(child.cmd) && !child.cmd.includes('attach') && !child.cmd.includes('serve');
-		if (isBare) {
+		const adapter = getAdapter(meta.agent);
+		if (adapter.isBareTUICommand(child.cmd)) {
 			const paneCwd = await getLeftPaneCwd();
 			if (paneCwd === meta.cwd) {
 				logger.info('switchToWorker skipped: bare TUI already in this project', {name: meta.name, cwd: meta.cwd});
@@ -655,36 +625,12 @@ async function switchToWorker(meta: WorkerMeta): Promise<void> {
 		}
 	}
 
-	let cmd = attachCommand(meta);
+	const adapter = getAdapter(meta.agent);
 	logger.info('switchToWorker', {name: meta.name, agent: meta.agent, hasUrl: !!meta.process?.serve?.serverUrl, sessionId: meta.sessionId ?? 'null'});
 
-	if (!cmd && meta.agent === 'opencode') {
-		const servePid = meta.process?.serve?.pid;
-		if (servePid && isProcessAlive(servePid)) {
-			logger.info('serve process alive but no URL in metadata, inferring from lsof', {servePid});
-			const url = await inferUrlFromPid(servePid);
-			if (url && meta.sessionId) {
-				cmd = `opencode attach ${url} --session ${meta.sessionId}`;
-				await workerRepo.update(meta.name, (m) => ({...m, process: {...m.process, serve: {...m.process?.serve, serverUrl: url}}} as any));
-				logger.info('inferred URL from lsof', {url});
-			}
-		}
-	}
-
-	if (!cmd && meta.agent === 'opencode' && meta.sessionId) {
-		logger.info('starting resumeServe for idle worker');
-		const adapter = getAdapter('opencode') as any;
-		const {ensureServerUp} = await import('../../application/orchestration/commands/utils.js');
-		const result = await adapter.resumeServe({
-			workerName: meta.name,
-			cwdAbs: meta.cwd,
-			workbossServerUrl: await ensureServerUp(),
-		});
-		const serve = {pid: result.pid, serverUrl: result.serverUrl, serverPort: result.serverPort, startedAt: new Date().toISOString()};
-		await workerRepo.update(meta.name, (m) => ({...m, process: {...m.process, serve}} as any));
-		cmd = `opencode attach ${result.serverUrl} --session ${meta.sessionId}`;
-		logger.info('resumeServe done, using old sessionId', {url: result.serverUrl, sessionId: meta.sessionId});
-	}
+	const {ensureServerUp} = await import('../../application/orchestration/commands/utils.js');
+	const serverUrl = await ensureServerUp();
+	const cmd = await adapter.resumeAndAttach(meta, serverUrl);
 
 	if (cmd) {
 		logger.info('runInLeftPane', {cmd});
@@ -705,7 +651,8 @@ async function switchToOrchestrator(): Promise<void> {
 		logger.warn('no orchestrator state file found');
 		return;
 	}
-	const cmd = state.agent === 'claude' ? 'claude' : 'opencode';
+	const adapter = getAdapter(state.agent as 'opencode' | 'claude');
+	const cmd = adapter.getLaunchCommand({});
 	logger.info('switchToOrchestrator', {agent: state.agent});
 	await runInLeftPane(cmd);
 }
@@ -713,8 +660,7 @@ async function switchToOrchestrator(): Promise<void> {
 const workerRepo = new FsWorkerRepository();
 
 export async function runDashboardLoop(): Promise<void> {
-	const approvalRepo = new FsApprovalRepository();
-	const dashboard = new Dashboard(workerRepo, approvalRepo);
+	const dashboard = new Dashboard(workerRepo);
 
 	while (true) {
 		const action = await dashboard.show();

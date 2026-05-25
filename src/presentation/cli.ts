@@ -20,7 +20,8 @@ function parse(argv: string[]): ParsedArgs {
 	const positional: string[] = [];
 	const flags = new Map<string, string | boolean>();
 	for (let i = 0; i < argv.length; i++) {
-		const tok = argv[i]!;
+		const tok = argv[i];
+		if (!tok) continue;
 		if (tok.startsWith('--')) {
 			const eq = tok.indexOf('=');
 			if (eq !== -1) {
@@ -68,7 +69,8 @@ async function main(): Promise<void> {
 		return;
 	}
 
-	const cmd = args[0]!;
+	const cmd = args[0];
+	if (!cmd) { printHelp(); return; }
 	const rest = parse(args.slice(1));
 
 	switch (cmd) {
@@ -115,7 +117,7 @@ async function main(): Promise<void> {
 				missionFile: s(rest, 'mission'),
 				missionInline: s(rest, 'task'),
 				agent: (s(rest, 'agent') as AgentKind | undefined) ?? 'opencode',
-				port: s(rest, 'port') ? parseInt(s(rest, 'port')!, 10) : undefined,
+				port: s(rest, 'port') ? parseInt(s(rest, 'port') ?? '0', 10) : undefined,
 			});
 		}
 

@@ -3,14 +3,10 @@ import type {WorkerMeta} from '../../domain/worker.js';
 import type {PendingApproval} from '../../domain/approval.js';
 import type {WorkerRepository} from '../../domain/worker.js';
 import type {ApprovalRepository} from '../../domain/approval.js';
-import {matchHardDeny} from '../../infrastructure/agent-config/deny-patterns.js';
-import {
-  classifyToolName,
-  extractPatterns,
-  type ClaudePreToolUseRequest,
-} from '../../infrastructure/agent-config/claude-config.js';
-import {getAdapter, claudeAdapter} from '../orchestration/agents/index.js';
+import {getAdapter, listAdapters} from '../orchestration/agents/index.js';
+import type {HookContext} from '../orchestration/agents/types.js';
 import type {WorkerPatrol} from './worker-patrol.js';
+import {reconcileOrphans} from './orphan-cleaner.js';
 import type {LivenessWatcher} from './liveness-watcher.js';
 import type {RpcRequest, RpcResponse} from '../../infrastructure/http/server-rpc.js';
 import {createLogger} from '../../infrastructure/logging/logger.js';
@@ -22,6 +18,8 @@ interface Registration {
 }
 
 const logger = createLogger('daemon');
+
+const HOOK_ROUTE_PREFIX = '/claude-hook/';
 
 export class Daemon {
   private workerRepo: WorkerRepository;
@@ -38,6 +36,16 @@ export class Daemon {
     this.workerRepo = workerRepo;
     this.approvalRepo = approvalRepo;
     this.workerPatrol = workerPatrol;
+  }
+
+  private initHookContext(): void {
+    const hookCtx: HookContext = {
+      workerRepo: this.workerRepo,
+      approvalRepo: this.approvalRepo,
+    };
+    for (const adapter of listAdapters()) {
+      adapter.setHookContext?.(hookCtx);
+    }
   }
 
   private async registerForEvents(meta: WorkerMeta): Promise<void> {
@@ -158,106 +166,36 @@ export class Daemon {
     res.end(JSON.stringify(body));
   }
 
-  private sendClaudeHookDecision(
-    res: http.ServerResponse,
-    decision: 'allow' | 'deny' | 'ask',
-    reason: string,
-  ): void {
-    this.sendJson(res, 200, {
-      hookSpecificOutput: {
-        hookEventName: 'PreToolUse',
-        permissionDecision: decision,
-        ...(reason ? {permissionDecisionReason: reason} : {}),
-      },
-    });
-  }
-
-  private async handleClaudeHook(
+  private async dispatchHookRequest(
     req: http.IncomingMessage,
     res: http.ServerResponse,
     workerName: string,
   ): Promise<void> {
     const reg = this.registry.get(workerName);
     if (!reg) {
-      logger.info(`claude hook from unknown worker "${workerName}", returning ask`);
-      this.sendClaudeHookDecision(res, 'ask', `workboss does not know worker "${workerName}"`);
-      return;
-    }
-    if (reg.meta.agent !== 'claude') {
-      this.sendClaudeHookDecision(
-        res,
-        'ask',
-        `worker "${workerName}" is not registered as a claude worker`,
-      );
-      return;
-    }
-
-    let body: ClaudePreToolUseRequest;
-    try {
-      body = await this.readJson<ClaudePreToolUseRequest>(req);
-    } catch (err) {
-      this.sendJson(res, 400, {error: `bad json: ${String(err)}`});
-      return;
-    }
-
-    if (body.session_id && !reg.meta.sessionId) {
-      await this.workerRepo.update(workerName, m => ({...m, sessionId: body.session_id}));
-      reg.meta.sessionId = body.session_id;
-      logger.info(`${workerName}: learned session_id=${body.session_id}`);
-    }
-
-    const permission = classifyToolName(body.tool_name);
-    const patterns = extractPatterns(body.tool_name, body.tool_input);
-
-    const hit = matchHardDeny(permission, patterns);
-    if (hit) {
-      logger.info(
-        `QUEUE APPROVAL ${workerName} ${body.tool_name}: ${hit.reason} (${JSON.stringify(patterns)})`,
-      );
-      const approvalId = `claude_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-      const approval: PendingApproval = {
-        id: approvalId,
-        worker: workerName,
-        sessionID: body.session_id ?? '',
-        permission,
-        patterns,
-        metadata: { tool_name: body.tool_name, tool_input: body.tool_input },
-        always: [],
-        capturedAt: new Date().toISOString(),
-      };
-      await this.approvalRepo.write(approval);
-
-      const HOOK_TIMEOUT_MS = 60_000;
-      let settled = false;
-      const timer = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        claudeAdapter.dropHookResponder(approvalId);
-        void this.approvalRepo.delete(approvalId);
-        logger.info(`claude hook ${approvalId} timed out, returning ask`);
-        this.sendClaudeHookDecision(res, 'ask', 'workboss: no orchestrator response within 60s');
-      }, HOOK_TIMEOUT_MS);
-
-      claudeAdapter.registerHookResponder(approvalId, (response) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        this.sendJson(res, 200, response);
-      });
-
-      res.on('close', () => {
-        if (!settled) {
-          settled = true;
-          clearTimeout(timer);
-          claudeAdapter.dropHookResponder(approvalId);
-          logger.info(`claude hook ${approvalId} dropped by client before reply — keeping approval for orchestrator`);
-        }
+      this.sendJson(res, 200, {
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'ask',
+          permissionDecisionReason: `workboss does not know worker "${workerName}"`,
+        },
       });
       return;
     }
 
-    this.sendClaudeHookDecision(res, 'allow', '');
-    return;
+    const adapter = getAdapter(reg.meta.agent);
+    if (adapter.handleHookRequest) {
+      await adapter.handleHookRequest(req, res, workerName);
+      return;
+    }
+
+    this.sendJson(res, 200, {
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'ask',
+        permissionDecisionReason: `worker "${workerName}" agent ${reg.meta.agent} has no hook handler`,
+      },
+    });
   }
 
   private startHttpServer(): Promise<void> {
@@ -274,11 +212,11 @@ export class Daemon {
             }
             return;
           }
-          if (req.method === 'POST' && url.startsWith('/claude-hook/')) {
-            await this.handleClaudeHook(
+          if (req.method === 'POST' && url.startsWith(HOOK_ROUTE_PREFIX)) {
+            await this.dispatchHookRequest(
               req,
               res,
-              decodeURIComponent(url.slice('/claude-hook/'.length)),
+              decodeURIComponent(url.slice(HOOK_ROUTE_PREFIX.length)),
             );
             return;
           }
@@ -296,25 +234,26 @@ export class Daemon {
   }
 
   async run(): Promise<void> {
+    this.initHookContext();
+
     await this.startHttpServer();
     const workbossUrl = getServerUrl();
     logger.info(`workboss server up on ${workbossUrl}, pid=${process.pid}`);
 
-    for (const meta of await this.workerRepo.list()) {
-      if (meta.agent === 'claude') {
-        const {writeClaudeSettings} = await import(
-          '../../infrastructure/agent-config/claude-config.js'
-        );
-        await writeClaudeSettings(meta.cwd, {
-          workerName: meta.name,
-          workbossServerUrl: workbossUrl,
-        }).catch(err =>
-          logger.info(`update claude settings ${meta.name} failed: ${String(err)}`),
-        );
-      }
+    const allWorkers = await this.workerRepo.list();
+
+    await reconcileOrphans(allWorkers).catch(err =>
+      logger.info(`orphan reconciliation failed: ${String(err)}`),
+    );
+
+    for (const meta of allWorkers) {
+      const adapter = getAdapter(meta.agent);
+      await adapter.refreshDaemonSettings(meta, workbossUrl).catch(err =>
+        logger.info(`refresh settings ${meta.name} failed: ${String(err)}`),
+      );
     }
 
-    for (const meta of await this.workerRepo.list()) {
+    for (const meta of allWorkers) {
       await this.registerForEvents(meta).catch(err =>
         logger.info(`attach ${meta.name} failed: ${String(err)}`),
       );
@@ -333,13 +272,11 @@ export class Daemon {
     const shutdown = async (sig: string) => {
       logger.info(`received ${sig}, shutting down`);
       for (const r of this.registry.values()) r.abort.abort();
-      claudeAdapter.respondToAllPending({
-        hookSpecificOutput: {
-          hookEventName: 'PreToolUse',
-          permissionDecision: 'ask',
-          permissionDecisionReason: 'workboss server is shutting down',
-        },
-      });
+      for (const adapter of listAdapters()) {
+        await adapter.shutdown().catch(err =>
+          logger.info(`adapter shutdown failed: ${String(err)}`),
+        );
+      }
       process.exit(0);
     };
     process.on('SIGINT', () => void shutdown('SIGINT'));

@@ -2,9 +2,10 @@ import {claudeAdapter} from './claude.js';
 import {openCodeAdapter} from './opencode.js';
 import type {AgentAdapter} from './types.js';
 import type {AgentKind} from '../../../domain/worker.js';
+import {registerBareTUIDetector} from '../../../infrastructure/tmux/tmux.js';
 
-export {claudeAdapter, openCodeAdapter};
 export type {AgentAdapter} from './types.js';
+export type {ClassifiedProcess, DiscoveredSession, HookContext} from './types.js';
 
 const REGISTRY: Record<AgentKind, AgentAdapter> = {
 	claude: claudeAdapter,
@@ -20,3 +21,10 @@ export function getAdapter(kind: AgentKind): AgentAdapter {
 export function listAdapters(): AgentAdapter[] {
 	return Object.values(REGISTRY);
 }
+
+registerBareTUIDetector((cmd: string) => {
+	for (const adapter of Object.values(REGISTRY)) {
+		if (adapter.isBareTUICommand(cmd)) return true;
+	}
+	return false;
+});
