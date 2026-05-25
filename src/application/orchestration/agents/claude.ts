@@ -18,6 +18,7 @@ import type {WorkerMeta, LivenessResult} from '../../../domain/worker.js';
 import type {PendingApproval} from '../../../domain/approval.js';
 import {isProcessAlive} from '../../../infrastructure/process/process.js';
 import type {
+	ActivitySummary,
 	AgentAdapter,
 	AttachHint,
 	ClassifiedProcess,
@@ -496,6 +497,110 @@ class ClaudeAdapter implements AgentAdapter {
 			cwd,
 			sessionId,
 			alive: true,
+		};
+	}
+
+	async getActivitySummary(meta: WorkerMeta, sinceHours: number): Promise<ActivitySummary | null> {
+		const sessionId = meta.sessionId;
+		if (!sessionId) return null;
+
+		const claudeDir = path.join(os.homedir(), '.claude', 'projects');
+		let sessionFile: string | null = null;
+		try {
+			const projectDirs = await fs.readdir(claudeDir);
+			for (const pDir of projectDirs) {
+				const candidate = path.join(claudeDir, pDir, `${sessionId}.jsonl`);
+				try {
+					await fs.access(candidate);
+					sessionFile = candidate;
+					break;
+				} catch {
+					continue;
+				}
+			}
+		} catch {
+			return null;
+		}
+		if (!sessionFile) return null;
+
+		const sinceMs = Date.now() - sinceHours * 3600_000;
+		let lastActiveTs = 0;
+		let firstTs = Infinity;
+		const recentActions: ActivitySummary['recentActions'] = [];
+		const recentUserMessages: string[] = [];
+
+		const data = await fs.readFile(sessionFile, 'utf8');
+		const lines = data.split('\n');
+		for (const line of lines) {
+			if (!line) continue;
+			try {
+				const parsed = JSON.parse(line) as Record<string, unknown>;
+				if (parsed.type !== 'user' && parsed.type !== 'assistant') continue;
+
+				const msg = parsed.message as Record<string, unknown> | undefined;
+				if (!msg) continue;
+
+				const tsStr = parsed.timestamp as string | undefined;
+				const ts = tsStr ? new Date(tsStr).getTime() : 0;
+
+				if (ts > 0) {
+					if (ts < firstTs) firstTs = ts;
+					if (ts > lastActiveTs) lastActiveTs = ts;
+				}
+
+				if (ts < sinceMs) continue;
+
+				const content = msg.content;
+				if (typeof content === 'string') {
+					if (parsed.type === 'user' && content.trim()) {
+						recentUserMessages.push(content.slice(0, 120).replace(/\n/g, ' '));
+					}
+				} else if (Array.isArray(content)) {
+					for (const block of content) {
+						if (typeof block !== 'object' || !block) continue;
+						const b = block as Record<string, unknown>;
+						if (parsed.type === 'user' && b.type === 'text' && typeof b.text === 'string' && (b.text as string).trim()) {
+							recentUserMessages.push((b.text as string).slice(0, 120).replace(/\n/g, ' '));
+						}
+						if (parsed.type === 'assistant' && b.type === 'tool_use') {
+							const toolName = (b.name as string) || '?';
+							const input = b.input as Record<string, unknown> | undefined;
+							let summary = '';
+							if (toolName === 'Bash' && input) {
+								summary = (input['command'] as string || '').slice(0, 60);
+							} else if (toolName === 'Write' && input) {
+								summary = (input['file_path'] as string || '').slice(0, 60);
+							} else if (toolName === 'Read' && input) {
+								summary = (input['file_path'] as string || '').slice(0, 60);
+							} else if (input) {
+								summary = JSON.stringify(input).slice(0, 60);
+							}
+							recentActions.push({
+								tool: toolName,
+								summary,
+								timestamp: ts > 0 ? new Date(ts) : new Date(),
+							});
+						}
+					}
+				}
+			} catch {
+				continue;
+			}
+		}
+
+		const activeMinutes = firstTs < Infinity && lastActiveTs > 0
+			? Math.round((lastActiveTs - firstTs) / 60_000)
+			: 0;
+
+		return {
+			title: path.basename(meta.cwd),
+			lastActiveAt: lastActiveTs > 0 ? new Date(lastActiveTs) : null,
+			activeMinutes,
+			additions: 0,
+			deletions: 0,
+			filesChanged: 0,
+			recentActions: recentActions.slice(-10),
+			recentUserMessages: recentUserMessages.slice(-5),
 		};
 	}
 }

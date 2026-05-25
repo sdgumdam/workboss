@@ -129,6 +129,25 @@ export interface HookContext {
 	};
 }
 
+// ---------- activity summary (worker briefing) ----------
+
+export interface RecentAction {
+	tool: string;
+	summary: string;
+	timestamp: Date;
+}
+
+export interface ActivitySummary {
+	title: string;
+	lastActiveAt: Date | null;
+	activeMinutes: number;
+	additions: number;
+	deletions: number;
+	filesChanged: number;
+	recentActions: RecentAction[];
+	recentUserMessages: string[];
+}
+
 // ---------- adapter ----------
 
 export interface AgentAdapter {
@@ -231,4 +250,8 @@ export interface AgentAdapter {
 	findSessionIdByCwd(cwd: string): Promise<string | undefined>;
 	findHistoricalSessions(): Promise<DiscoveredSession[]>;
 	enrichAliveSession(hit: ClassifiedProcess, cwd: string): Promise<DiscoveredSession>;
+
+	// ---------- worker briefing ----------
+
+	getActivitySummary(meta: WorkerMeta, sinceHours: number): Promise<ActivitySummary | null>;
 }

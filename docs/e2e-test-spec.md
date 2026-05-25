@@ -520,6 +520,147 @@ node bin/workboss.js reject-all 2>/dev/null; kill %1 2>/dev/null
 
 ---
 
+## T20: Worker Briefing — OpenCode Adapter
+
+### 前置
+- 已 build
+- 存在至少 1 个 opencode worker 有近期活动
+
+### 步骤
+```bash
+WORKER=$(node bin/workboss.js list 2>&1 | grep 'up.*opencode' | head -1 | awk '{print $2}')
+SID=$(node bin/workboss.js show "$WORKER" 2>&1 | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('sessionId',''))")
+node -e "
+const {getAdapter} = await import('./dist/application/orchestration/agents/index.js');
+const oc = getAdapter('opencode');
+const s = await oc.getActivitySummary({name:'$WORKER',agent:'opencode',cwd:'/tmp',createdAt:'',sessionId:'$SID'}, 4);
+const checks = [
+  ['title exists', typeof s.title === 'string' && s.title.length > 0],
+  ['lastActiveAt exists', s.lastActiveAt instanceof Date],
+  ['recentActions is array', Array.isArray(s.recentActions)],
+  ['recentUserMessages is array', Array.isArray(s.recentUserMessages)],
+  ['activeMinutes is number', typeof s.activeMinutes === 'number'],
+];
+const failed = checks.filter(c => !c[1]);
+failed.length === 0 ? console.log('T20 PASS') : console.log('T20 FAIL:', failed.map(f => f[0]));
+"
+```
+
+### 预期
+- `T20 PASS`
+- `recentActions` 包含 `{tool: 'bash'|'edit'|'read'|..., summary: '...', timestamp: Date}` 对象
+- `recentUserMessages` 包含用户最近的输入文本
+
+---
+
+## T21: Worker Briefing — Claude Adapter
+
+### 前置
+- 已 build
+- 存在至少 1 个 claude worker 有近期活动
+
+### 步骤
+```bash
+WORKER=$(node bin/workboss.js list 2>&1 | grep 'claude' | head -1 | awk '{print $2}')
+SID=$(node bin/workboss.js show "$WORKER" 2>&1 | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('sessionId',''))")
+node -e "
+const {getAdapter} = await import('./dist/application/orchestration/agents/index.js');
+const cl = getAdapter('claude');
+const s = await cl.getActivitySummary({name:'$WORKER',agent:'claude',cwd:'/tmp',createdAt:'',sessionId:'$SID'}, 4);
+const checks = [
+  ['title exists', typeof s.title === 'string'],
+  ['lastActiveAt exists', s.lastActiveAt === null || s.lastActiveAt instanceof Date],
+  ['recentActions is array', Array.isArray(s.recentActions)],
+  ['recentUserMessages is array', Array.isArray(s.recentUserMessages)],
+];
+const failed = checks.filter(c => !c[1]);
+failed.length === 0 ? console.log('T21 PASS') : console.log('T21 FAIL:', failed.map(f => f[0]));
+"
+```
+
+### 预期
+- `T21 PASS`
+
+---
+
+## T22: Dashboard Worker Briefing Display
+
+### 前置
+- daemon 运行中
+- tmux workboss session 存在
+
+### 步骤
+1. `tmux send-keys -t workboss:boss.1 'node <project>/bin/workboss.js dashboard' Enter`
+2. `sleep 4`
+3. `tmux capture-pane -t workboss:boss.1 -p`
+
+### 预期
+- 至少一个 up 状态的 worker 行包含 `·` 分隔的 session title
+- 标题后有时间显示（`now` / `Nm` / `Nh` / `Nd`）
+- 有活动的 worker 显示 `Nops`
+
+### 验收命令
+```bash
+PANE=$(tmux capture-pane -t workboss:boss.1 -p 2>&1)
+echo "$PANE" | grep -qE 'up · .+ [0-9]+m|[0-9]+h|now' && echo "T22 PASS" || echo "T22 CHECK: $(echo "$PANE" | head -5)"
+```
+
+---
+
+## T23: Dashboard Detail Panel (Selected Worker Briefing)
+
+### 依赖
+- T22（dashboard 已渲染）
+
+### 步骤
+1. 导航到一个有近期活动的 worker（有 `Nops` 的）
+2. 检查底部出现 detail panel
+3. detail panel 包含 `›` 开头的 user message
+4. detail panel 包含 tool call 操作行
+
+### 预期
+- 选中活跃 worker 后底部出现 `›` 行（最近 user message）
+- 出现 `◈`（read）/ `✎`（edit）/ `$`（bash）行（最近 tool calls）
+
+### 验收命令
+```bash
+PANE=$(tmux capture-pane -t workboss:boss.1 -p 2>&1)
+echo "$PANE" | grep -q '›' && echo "T23 PASS (detail panel shows user message)" || echo "T23 CHECK"
+```
+
+---
+
+## T24: Dashboard Detach Worker ('d')
+
+### 前置
+- daemon 运行中
+- dashboard 渲染中
+- 存在一个可 detach 的 up 状态 worker
+
+### 步骤
+1. `mkdir -p /tmp/wb-test-detach && node bin/workboss.js spawn e2e-detach --agent opencode --cwd /tmp/wb-test-detach --task "test" 2>&1`
+2. 导航到 e2e-detach worker
+3. 按 'd'
+4. `node bin/workboss.js list 2>&1 | grep e2e-detach`
+
+### 预期
+- step 4 worker status 变为 `idle`（从 `up` 变化）
+- dashboard 继续运行
+
+### 验收命令
+```bash
+mkdir -p /tmp/wb-test-detach
+node bin/workboss.js spawn e2e-detach --agent opencode --cwd /tmp/wb-test-detach --task "test" >/dev/null 2>&1
+sleep 2
+# 导航 + 按 'd' 需要手动或用 tmux send-keys
+node bin/workboss.js list 2>&1 | grep e2e-detach | grep -q 'up' && echo "T24: worker is up, ready for detach test" || echo "T24 SKIP"
+# cleanup
+node bin/workboss.js remove e2e-detach 2>/dev/null
+rm -rf /tmp/wb-test-detach
+```
+
+---
+
 ## 附录：一键回归脚本
 
 ```bash

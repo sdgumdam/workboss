@@ -21,6 +21,7 @@ import type {PendingApproval} from '../../../domain/approval.js';
 import {isProcessAlive} from '../../../infrastructure/process/process.js';
 import {injectBootstrapDoc} from './shared.js';
 import type {
+	ActivitySummary,
 	AgentAdapter,
 	AttachHint,
 	ClassifiedProcess,
@@ -598,6 +599,123 @@ class OpenCodeAdapter implements AgentAdapter {
 			sessionId,
 			alive: true,
 		};
+	}
+
+	async getActivitySummary(meta: WorkerMeta, sinceHours: number): Promise<ActivitySummary | null> {
+		const dbPath = path.join(os.homedir(), '.local', 'share', 'opencode', 'opencode.db');
+		try {
+			await fs.access(dbPath);
+		} catch {
+			return null;
+		}
+
+		let sessionId = meta.sessionId;
+		if (!sessionId) {
+			sessionId = await this.findSessionIdByCwd(meta.cwd);
+		}
+		if (!sessionId) return null;
+
+		try {
+			const {stdout: sessionRow} = await execFileAsync('sqlite3', [
+				dbPath,
+				`SELECT s.title, s.summary_additions, s.summary_deletions, s.summary_files,
+				        s.time_updated, s.time_created,
+				        (SELECT MAX(m.time_created) FROM message m WHERE m.session_id = s.id)
+				 FROM session s WHERE s.id = '${sessionId}'`,
+			]);
+
+			const cols = sessionRow.trim().split('|');
+			if (cols.length < 6) return null;
+
+			const title = cols[0] || '(untitled)';
+			const additions = parseInt(cols[1] || '0', 10) || 0;
+			const deletions = parseInt(cols[2] || '0', 10) || 0;
+			const filesChanged = parseInt(cols[3] || '0', 10) || 0;
+			const updatedMs = parseInt(cols[4] || '0', 10) || 0;
+			const createdMs = parseInt(cols[5] || '0', 10) || 0;
+			const lastMsgMs = parseInt(cols[6] || '0', 10) || 0;
+			const lastActiveTs = lastMsgMs || updatedMs;
+			const activeMinutes = createdMs > 0 && updatedMs > 0
+				? Math.round((updatedMs - createdMs) / 60_000)
+				: 0;
+
+			const sinceMs = Date.now() - sinceHours * 3600_000;
+
+			const {stdout: toolRows} = await execFileAsync('sqlite3', [
+				dbPath,
+				`SELECT p.data FROM part p
+				 WHERE p.session_id = '${sessionId}'
+				   AND p.time_created > ${sinceMs}
+				   AND json_extract(p.data, '$.type') = 'tool'
+				   AND json_extract(p.data, '$.state.status') = 'completed'
+				 ORDER BY p.time_created DESC LIMIT 10`,
+			]);
+
+			const recentActions: ActivitySummary['recentActions'] = [];
+			for (const line of toolRows.trim().split('\n')) {
+				if (!line) continue;
+				try {
+					const d = JSON.parse(line) as {
+						tool: string;
+						state?: {input?: Record<string, unknown>; metadata?: {description?: string}};
+					};
+					const toolName = d.tool || '?';
+					const input = d.state?.input ?? {};
+					let summary = '';
+					if (toolName === 'bash') {
+						summary = (input['command'] as string || '').slice(0, 60);
+					} else if (toolName === 'edit') {
+						summary = (input['filePath'] as string || '').slice(0, 60);
+					} else if (toolName === 'write') {
+						summary = (input['filePath'] as string || '').slice(0, 60);
+					} else if (toolName === 'read') {
+						summary = (input['filePath'] as string || '').slice(0, 60);
+					} else {
+						const desc = d.state?.metadata?.description;
+						summary = desc || JSON.stringify(input).slice(0, 60);
+					}
+					recentActions.push({tool: toolName, summary, timestamp: new Date()});
+				} catch {}
+			}
+
+			const {stdout: userRows} = await execFileAsync('sqlite3', [
+				dbPath,
+				`SELECT substr(p.data, 1, 500) FROM part p
+				 WHERE p.session_id = '${sessionId}'
+				   AND p.time_created > ${sinceMs}
+				   AND json_extract(p.data, '$.type') = 'text'
+				   AND EXISTS (
+				     SELECT 1 FROM message m
+				     WHERE m.id = p.message_id
+				       AND json_extract(m.data, '$.role') = 'user'
+				   )
+				 ORDER BY p.time_created DESC LIMIT 5`,
+			]);
+
+			const recentUserMessages: string[] = [];
+			for (const line of userRows.trim().split('\n')) {
+				if (!line) continue;
+				try {
+					const d = JSON.parse(line) as {text?: string};
+					if (d.text) {
+						recentUserMessages.push(d.text.slice(0, 120).replace(/\n/g, ' '));
+					}
+				} catch {}
+			}
+
+			return {
+				title,
+				lastActiveAt: lastActiveTs > 0 ? new Date(lastActiveTs) : null,
+				activeMinutes,
+				additions,
+				deletions,
+				filesChanged,
+				recentActions,
+				recentUserMessages,
+			};
+		} catch {
+			return null;
+		}
 	}
 }
 

@@ -5,6 +5,7 @@ import os from 'os';
 import {useState, useEffect, useCallback, useMemo, useRef} from 'react';
 import {render, Box, Text, useApp, useInput, useStdout} from 'ink';
 
+import type {ActivitySummary} from '../../application/orchestration/agents/types.js';
 import type {LivenessStatus, WorkerMeta, WorkerRepository} from '../../domain/worker.js';
 import type {PendingApproval} from '../../domain/approval.js';
 import {FsWorkerRepository} from '../../infrastructure/filesystem/worker-repo.js';
@@ -40,6 +41,8 @@ export type DashboardAction =
 	| {kind: 'back'}
 	| {kind: 'shutdown'}
 	| {kind: 'quit'}
+	| {kind: 'detach'; name: string}
+	| {kind: 'remove'; name: string}
 	| {kind: 'approve'; id: string}
 	| {kind: 'reject'; id: string}
 	| {kind: 'approve-all'}
@@ -59,6 +62,7 @@ interface WorkerDisplay {
 	sessionId: string;
 	shortSid: string;
 	pid?: number;
+	activity?: ActivitySummary;
 }
 
 interface MouseEvent {
@@ -205,6 +209,16 @@ function sortByLiveness(workers: WorkerDisplay[]): WorkerDisplay[] {
 const HEADER_ROWS = 2;
 const FOOTER_ROWS = 4;
 
+function formatTimeAgo(date: Date | null): string {
+	if (!date) return '';
+	const minutes = Math.floor((Date.now() - date.getTime()) / 60_000);
+	if (minutes < 1) return 'now';
+	if (minutes < 60) return `${minutes}m`;
+	const hours = Math.floor(minutes / 60);
+	if (hours < 24) return `${hours}h`;
+	return `${Math.floor(hours / 24)}d`;
+}
+
 function WorkerRow({worker, selected, isCurrent}: {
 	worker: WorkerDisplay;
 	selected: boolean;
@@ -227,6 +241,19 @@ function WorkerRow({worker, selected, isCurrent}: {
 			<Text dimColor> {worker.shortSid}</Text>
 			{worker.pid ? <Text dimColor>:{worker.pid}</Text> : null}
 			<Text dimColor> {worker.status}</Text>
+			{worker.activity ? (
+				<>
+					<Text dimColor> · </Text>
+					<Text dimColor>{worker.activity.title.slice(0, 30)}</Text>
+					<Text dimColor> {formatTimeAgo(worker.activity.lastActiveAt)}</Text>
+					{worker.activity.recentActions.length > 0 ? (
+						<Text dimColor> {worker.activity.recentActions.length}ops</Text>
+					) : null}
+					{worker.activity.filesChanged > 0 ? (
+						<Text dimColor> Δ{worker.activity.additions}+{worker.activity.deletions}-{worker.activity.filesChanged}f</Text>
+					) : null}
+				</>
+			) : null}
 		</Text>
 	);
 }
@@ -308,6 +335,22 @@ function DashboardView({workerRepo, onAction}: DashboardProps) {
 			Promise.all(raw.map((meta) => readMissionTitle(meta.name))),
 		]);
 
+		const activityMap = new Map<string, ActivitySummary>();
+		await Promise.all(
+			raw
+				.filter((meta) => {
+					const s = livenessMap.get(meta.name);
+					return s === 'up' || s === 'degraded';
+				})
+				.map(async (meta) => {
+					try {
+						const adapter = getAdapter(meta.agent);
+						const summary = await adapter.getActivitySummary(meta, 4);
+						if (summary) activityMap.set(meta.name, summary);
+					} catch {}
+				}),
+		);
+
 		const enriched: WorkerDisplay[] = raw.map((meta, i) => {
 			const sid = meta.sessionId ?? '';
 			const shortSid = sid.length > 8 ? sid.slice(-8) : sid;
@@ -320,6 +363,7 @@ function DashboardView({workerRepo, onAction}: DashboardProps) {
 				sessionId: sid,
 				shortSid,
 				pid: meta.process?.serve?.pid,
+				activity: activityMap.get(meta.name),
 			};
 		});
 
@@ -440,6 +484,14 @@ function DashboardView({workerRepo, onAction}: DashboardProps) {
 			if (visibleApprovals.length > 0) fire({kind: 'approve-all'});
 		} else if (_input === 'R') {
 			if (visibleApprovals.length > 0) fire({kind: 'reject-all'});
+		} else if (_input === 'd') {
+			if (workers.length === 0) return;
+			const worker = workers[selectedIndex];
+			if (worker) fire({kind: 'detach', name: worker.name});
+		} else if (_input === 'x') {
+			if (workers.length === 0) return;
+			const worker = workers[selectedIndex];
+			if (worker) fire({kind: 'remove', name: worker.name});
 		}
 	});
 
@@ -516,6 +568,41 @@ function DashboardView({workerRepo, onAction}: DashboardProps) {
 			</Box>
 
 			<Box flexDirection="column">
+				{(() => {
+					const selected = workers[selectedIndex];
+					if (!selected?.activity) return null;
+					const act = selected.activity;
+					const lines: React.ReactNode[] = [];
+					if (act.recentUserMessages.length > 0) {
+						const lastMsg = act.recentUserMessages[0];
+						if (lastMsg) {
+							lines.push(
+								<Box key="msg">
+									<Text color="cyan">{'› '}</Text>
+									<Text dimColor>{lastMsg.length > 80 ? lastMsg.slice(0, 77) + '...' : lastMsg}</Text>
+								</Box>,
+							);
+						}
+					}
+					if (act.recentActions.length > 0) {
+						const actions = act.recentActions.slice(-3).reverse();
+						for (let idx = 0; idx < actions.length; idx++) {
+							const a = actions[idx];
+							if (!a) continue;
+							const label = a.tool === 'bash' ? '$' : a.tool === 'edit' || a.tool === 'write' ? '✎' : a.tool === 'read' ? '◈' : '·';
+							lines.push(
+								<Box key={`act-${idx}`}>
+									<Text dimColor>{`  ${label} `}</Text>
+									<Text dimColor>{a.summary.length > 70 ? a.summary.slice(0, 67) + '...' : a.summary}</Text>
+								</Box>,
+							);
+						}
+					}
+					return lines.length > 0 ? <>{lines}</> : null;
+				})()}
+			</Box>
+
+			<Box flexDirection="column">
 				{visibleApprovals.length > 0 ? (
 					<>
 						{visibleApprovals.slice(0, 3).map((a) => {
@@ -555,7 +642,7 @@ function DashboardView({workerRepo, onAction}: DashboardProps) {
 			<Box>
 				<Text dimColor>
 					{' '}
-					{time} | {workers.length}w | Tab·↑↓·Enter·click · o back · a/r approve/reject · A/R all · s shutdown · ⌘C
+					{time} | {workers.length}w | Tab·↑↓·Enter·click · o back · d detach · x remove · a/r approve/reject · A/R all · s shutdown · ⌘C
 				</Text>
 			</Box>
 		</Box>
@@ -683,6 +770,23 @@ export async function runDashboardLoop(): Promise<void> {
 
 		if (action.kind === 'back') {
 			await switchToOrchestrator();
+		}
+
+		if (action.kind === 'detach' || action.kind === 'remove') {
+			const {detachWorker, removeWorker} = await import(
+				'../../application/orchestration/commands/lifecycle.js'
+			);
+			if (action.kind === 'detach') {
+				logger.info('dashboard detach', {name: action.name});
+				await detachWorker(action.name).catch(err =>
+					logger.info(`dashboard detach failed: ${String(err)}`),
+				);
+			} else {
+				logger.info('dashboard remove', {name: action.name});
+				await removeWorker(action.name).catch(err =>
+					logger.info(`dashboard remove failed: ${String(err)}`),
+				);
+			}
 		}
 	}
 }

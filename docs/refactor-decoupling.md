@@ -1,7 +1,7 @@
 # Refactor Plan: 编排层与具体 Agent 解耦 + Worker 关闭闭环
 
 > Created: 2026-05-24
-> Last updated: 2026-05-24
+> Last updated: 2026-05-25
 
 ## 目标
 
@@ -232,5 +232,7 @@ export interface ClassifiedProcess {
 | 2026-05-24 | 8 | 代码质量：删除死代码（inferUrlFromPid、attachCommand、respawnOpenCodeServe、AGENT_ICON、isProcessStillOurs）；清理 exports（claudeAdapter/openCodeAdapter 不再 export）；session-scanner 492→128 行 | done |
 | 2026-05-24 | 9 | npm run build 通过，tsc --noEmit 通过，无测试文件（E2E only） | done |
 | 2026-05-24 | 8+ | 补 eslint.config.mjs（ESLint 9 flat config），消除全部 10 个 non-null-assertion warnings，npm run build + npm run lint 均零问题 | done |
-| 2026-05-25 | E2E | 19 项端到端验证全部通过：daemon RPC、orphan cleaner、CLI list/discover、claude hook allow/queue、dashboard 渲染/worker 切换/orchestrator 切换/退出、worker spawn/remove、daemon shutdown、adapter identity/bareTUI/isOurProcess/buildAttachCommand | done |
-| 2026-05-25 | E2E doc | 编写 `docs/e2e-test-spec.md` — 19 个 test case，每个有前置/步骤/预期/验收命令，可由 coding agent 直接实现为一键脚本 | done |
+| 2026-05-25 01:50 | E2E | 19 项端到端验证全部通过 | done |
+| 2026-05-25 01:55 | E2E doc | 编写 `docs/e2e-test-spec.md` | done |
+| 2026-05-25 02:00 | feat | Dashboard worker 关闭：按 'd' detach / 'x' remove 选中 worker，调用 lifecycle 命令（通过 dynamic import），dashboard 继续运行。E2E 验证通过（e2e-detach 变 idle，e2e-remove 从 list 消失） | done |
+| 2026-05-25 03:30 | feat | Worker briefing（近期工作内容摘要）：新增 `ActivitySummary`/`RecentAction` 类型，opencode adapter 从 SQLite part 表查 recentUserMessages + recentActions（tool calls），claude adapter 从 JSONL 解析。Dashboard worker 行显示 session title + 活跃时间 + 操作数；选中时底部 detail panel 显示最近 user message + 最近 tool calls。E2E 验证通过 | done |
