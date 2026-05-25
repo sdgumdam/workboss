@@ -13,7 +13,7 @@ import {
 } from '../../../infrastructure/agent-config/claude-config.js';
 import {matchHardDeny} from '../../../infrastructure/agent-config/deny-patterns.js';
 import {createLogger} from '../../../infrastructure/logging/logger.js';
-import {injectBootstrapDoc} from './shared.js';
+import {injectBootstrapDoc, CLAUDE_PROJECTS_DIR, formatToolSummary, truncateMessage, RECENT_ACTIONS_LIMIT, RECENT_MESSAGES_LIMIT} from './shared.js';
 import type {WorkerMeta, LivenessResult} from '../../../domain/worker.js';
 import type {PendingApproval} from '../../../domain/approval.js';
 import {isProcessAlive} from '../../../infrastructure/process/process.js';
@@ -504,104 +504,118 @@ class ClaudeAdapter implements AgentAdapter {
 		const sessionId = meta.sessionId;
 		if (!sessionId) return null;
 
-		const claudeDir = path.join(os.homedir(), '.claude', 'projects');
-		let sessionFile: string | null = null;
-		try {
-			const projectDirs = await fs.readdir(claudeDir);
-			for (const pDir of projectDirs) {
-				const candidate = path.join(claudeDir, pDir, `${sessionId}.jsonl`);
-				try {
-					await fs.access(candidate);
-					sessionFile = candidate;
-					break;
-				} catch {
-					continue;
-				}
-			}
-		} catch {
-			return null;
-		}
+		const sessionFile = await findClaudeSessionFile(sessionId);
 		if (!sessionFile) return null;
 
 		const sinceMs = Date.now() - sinceHours * 3600_000;
-		let lastActiveTs = 0;
-		let firstTs = Infinity;
-		const recentActions: ActivitySummary['recentActions'] = [];
-		const recentUserMessages: string[] = [];
-
 		const data = await fs.readFile(sessionFile, 'utf8');
-		const lines = data.split('\n');
-		for (const line of lines) {
-			if (!line) continue;
+		const parsed = parseJsonlActivity(data, sinceMs);
+
+		return {
+			title: path.basename(meta.cwd),
+			lastActiveAt: parsed.lastActiveTs > 0 ? new Date(parsed.lastActiveTs) : null,
+			activeMinutes: parsed.activeMinutes,
+			additions: 0,
+			deletions: 0,
+			filesChanged: 0,
+			recentActions: parsed.recentActions.slice(-RECENT_ACTIONS_LIMIT),
+			recentUserMessages: parsed.recentUserMessages.slice(-RECENT_MESSAGES_LIMIT),
+		};
+	}
+}
+
+async function findClaudeSessionFile(sessionId: string): Promise<string | null> {
+	try {
+		const projectDirs = await fs.readdir(CLAUDE_PROJECTS_DIR);
+		for (const pDir of projectDirs) {
+			const candidate = path.join(CLAUDE_PROJECTS_DIR, pDir, `${sessionId}.jsonl`);
 			try {
-				const parsed = JSON.parse(line) as Record<string, unknown>;
-				if (parsed.type !== 'user' && parsed.type !== 'assistant') continue;
-
-				const msg = parsed.message as Record<string, unknown> | undefined;
-				if (!msg) continue;
-
-				const tsStr = parsed.timestamp as string | undefined;
-				const ts = tsStr ? new Date(tsStr).getTime() : 0;
-
-				if (ts > 0) {
-					if (ts < firstTs) firstTs = ts;
-					if (ts > lastActiveTs) lastActiveTs = ts;
-				}
-
-				if (ts < sinceMs) continue;
-
-				const content = msg.content;
-				if (typeof content === 'string') {
-					if (parsed.type === 'user' && content.trim()) {
-						recentUserMessages.push(content.slice(0, 120).replace(/\n/g, ' '));
-					}
-				} else if (Array.isArray(content)) {
-					for (const block of content) {
-						if (typeof block !== 'object' || !block) continue;
-						const b = block as Record<string, unknown>;
-						if (parsed.type === 'user' && b.type === 'text' && typeof b.text === 'string' && (b.text as string).trim()) {
-							recentUserMessages.push((b.text as string).slice(0, 120).replace(/\n/g, ' '));
-						}
-						if (parsed.type === 'assistant' && b.type === 'tool_use') {
-							const toolName = (b.name as string) || '?';
-							const input = b.input as Record<string, unknown> | undefined;
-							let summary = '';
-							if (toolName === 'Bash' && input) {
-								summary = (input['command'] as string || '').slice(0, 60);
-							} else if (toolName === 'Write' && input) {
-								summary = (input['file_path'] as string || '').slice(0, 60);
-							} else if (toolName === 'Read' && input) {
-								summary = (input['file_path'] as string || '').slice(0, 60);
-							} else if (input) {
-								summary = JSON.stringify(input).slice(0, 60);
-							}
-							recentActions.push({
-								tool: toolName,
-								summary,
-								timestamp: ts > 0 ? new Date(ts) : new Date(),
-							});
-						}
-					}
-				}
+				await fs.access(candidate);
+				return candidate;
 			} catch {
 				continue;
 			}
 		}
+	} catch {}
+	return null;
+}
 
-		const activeMinutes = firstTs < Infinity && lastActiveTs > 0
-			? Math.round((lastActiveTs - firstTs) / 60_000)
-			: 0;
+interface JsonlActivityResult {
+	lastActiveTs: number;
+	activeMinutes: number;
+	recentActions: ActivitySummary['recentActions'];
+	recentUserMessages: string[];
+}
 
-		return {
-			title: path.basename(meta.cwd),
-			lastActiveAt: lastActiveTs > 0 ? new Date(lastActiveTs) : null,
-			activeMinutes,
-			additions: 0,
-			deletions: 0,
-			filesChanged: 0,
-			recentActions: recentActions.slice(-10),
-			recentUserMessages: recentUserMessages.slice(-5),
-		};
+function parseJsonlActivity(data: string, sinceMs: number): JsonlActivityResult {
+	let lastActiveTs = 0;
+	let firstTs = Infinity;
+	const recentActions: ActivitySummary['recentActions'] = [];
+	const recentUserMessages: string[] = [];
+
+	for (const line of data.split('\n')) {
+		if (!line) continue;
+		let parsed: Record<string, unknown>;
+		try {
+			parsed = JSON.parse(line) as Record<string, unknown>;
+		} catch {
+			continue;
+		}
+
+		if (parsed.type !== 'user' && parsed.type !== 'assistant') continue;
+		const msg = parsed.message as Record<string, unknown> | undefined;
+		if (!msg) continue;
+
+		const tsStr = parsed.timestamp as string | undefined;
+		const ts = tsStr ? new Date(tsStr).getTime() : 0;
+		if (ts > 0) {
+			if (ts < firstTs) firstTs = ts;
+			if (ts > lastActiveTs) lastActiveTs = ts;
+		}
+		if (ts > 0 && ts < sinceMs) continue;
+
+		extractContentBlocks(parsed, msg, ts, recentUserMessages, recentActions);
+	}
+
+	const activeMinutes = firstTs < Infinity && lastActiveTs > 0
+		? Math.round((lastActiveTs - firstTs) / 60_000)
+		: 0;
+
+	return {lastActiveTs, activeMinutes, recentActions, recentUserMessages};
+}
+
+function extractContentBlocks(
+	parsed: Record<string, unknown>,
+	msg: Record<string, unknown>,
+	ts: number,
+	recentUserMessages: string[],
+	recentActions: ActivitySummary['recentActions'],
+): void {
+	const content = msg.content;
+	if (typeof content === 'string') {
+		if (parsed.type === 'user' && content.trim()) {
+			recentUserMessages.push(truncateMessage(content));
+		}
+		return;
+	}
+	if (!Array.isArray(content)) return;
+
+	for (const block of content) {
+		if (typeof block !== 'object' || !block) continue;
+		const b = block as Record<string, unknown>;
+
+		if (parsed.type === 'user' && b.type === 'text' && typeof b.text === 'string' && (b.text as string).trim()) {
+			recentUserMessages.push(truncateMessage(b.text as string));
+		}
+		if (parsed.type === 'assistant' && b.type === 'tool_use') {
+			const toolName = (b.name as string) || '?';
+			const input = (b.input as Record<string, unknown> | undefined) ?? {};
+			recentActions.push({
+				tool: toolName,
+				summary: formatToolSummary({toolName, input}),
+				timestamp: ts > 0 ? new Date(ts) : new Date(),
+			});
+		}
 	}
 }
 

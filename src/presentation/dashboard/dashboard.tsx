@@ -6,6 +6,12 @@ import {useState, useEffect, useCallback, useMemo, useRef} from 'react';
 import {render, Box, Text, useApp, useInput, useStdout} from 'ink';
 
 import type {ActivitySummary} from '../../application/orchestration/agents/types.js';
+import {
+	ROW_TITLE_MAX,
+	DETAIL_MSG_MAX,
+	DETAIL_ACTION_MAX,
+	DETAIL_ACTIONS_SHOWN,
+} from '../../application/orchestration/agents/shared.js';
 import type {LivenessStatus, WorkerMeta, WorkerRepository} from '../../domain/worker.js';
 import type {PendingApproval} from '../../domain/approval.js';
 import {FsWorkerRepository} from '../../infrastructure/filesystem/worker-repo.js';
@@ -209,6 +215,48 @@ function sortByLiveness(workers: WorkerDisplay[]): WorkerDisplay[] {
 const HEADER_ROWS = 2;
 const FOOTER_ROWS = 4;
 
+const TOOL_ROW_ICON: Record<string, string> = {
+	bash: '$', Bash: '$',
+	edit: '✎', write: '✎', Write: '✎',
+	read: '◈', Read: '◈',
+};
+
+function toolIcon(toolName: string): string {
+	return TOOL_ROW_ICON[toolName] ?? '·';
+}
+
+function truncateWithEllipsis(text: string, max: number): string {
+	return text.length > max ? text.slice(0, max - 3) + '...' : text;
+}
+
+function WorkerDetailPanel({activity}: {activity: ActivitySummary}) {
+	const elements: React.ReactNode[] = [];
+
+	const lastMsg = activity.recentUserMessages[0];
+	if (lastMsg) {
+		elements.push(
+			<Box key="msg">
+				<Text color="cyan">{'› '}</Text>
+				<Text dimColor>{truncateWithEllipsis(lastMsg, DETAIL_MSG_MAX)}</Text>
+			</Box>,
+		);
+	}
+
+	const actions = activity.recentActions.slice(-DETAIL_ACTIONS_SHOWN).reverse();
+	for (let idx = 0; idx < actions.length; idx++) {
+		const a = actions[idx];
+		if (!a) continue;
+		elements.push(
+			<Box key={`act-${idx}`}>
+				<Text dimColor>{`  ${toolIcon(a.tool)} `}</Text>
+				<Text dimColor>{truncateWithEllipsis(a.summary, DETAIL_ACTION_MAX)}</Text>
+			</Box>,
+		);
+	}
+
+	return elements.length > 0 ? <>{elements}</> : null;
+}
+
 function formatTimeAgo(date: Date | null): string {
 	if (!date) return '';
 	const minutes = Math.floor((Date.now() - date.getTime()) / 60_000);
@@ -244,7 +292,7 @@ function WorkerRow({worker, selected, isCurrent}: {
 			{worker.activity ? (
 				<>
 					<Text dimColor> · </Text>
-					<Text dimColor>{worker.activity.title.slice(0, 30)}</Text>
+					<Text dimColor>{worker.activity.title.slice(0, ROW_TITLE_MAX)}</Text>
 					<Text dimColor> {formatTimeAgo(worker.activity.lastActiveAt)}</Text>
 					{worker.activity.recentActions.length > 0 ? (
 						<Text dimColor> {worker.activity.recentActions.length}ops</Text>
@@ -571,34 +619,7 @@ function DashboardView({workerRepo, onAction}: DashboardProps) {
 				{(() => {
 					const selected = workers[selectedIndex];
 					if (!selected?.activity) return null;
-					const act = selected.activity;
-					const lines: React.ReactNode[] = [];
-					if (act.recentUserMessages.length > 0) {
-						const lastMsg = act.recentUserMessages[0];
-						if (lastMsg) {
-							lines.push(
-								<Box key="msg">
-									<Text color="cyan">{'› '}</Text>
-									<Text dimColor>{lastMsg.length > 80 ? lastMsg.slice(0, 77) + '...' : lastMsg}</Text>
-								</Box>,
-							);
-						}
-					}
-					if (act.recentActions.length > 0) {
-						const actions = act.recentActions.slice(-3).reverse();
-						for (let idx = 0; idx < actions.length; idx++) {
-							const a = actions[idx];
-							if (!a) continue;
-							const label = a.tool === 'bash' ? '$' : a.tool === 'edit' || a.tool === 'write' ? '✎' : a.tool === 'read' ? '◈' : '·';
-							lines.push(
-								<Box key={`act-${idx}`}>
-									<Text dimColor>{`  ${label} `}</Text>
-									<Text dimColor>{a.summary.length > 70 ? a.summary.slice(0, 67) + '...' : a.summary}</Text>
-								</Box>,
-							);
-						}
-					}
-					return lines.length > 0 ? <>{lines}</> : null;
+					return <WorkerDetailPanel activity={selected.activity} />;
 				})()}
 			</Box>
 
