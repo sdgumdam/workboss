@@ -8,6 +8,46 @@
 1. **每个 case 有前置条件、操作步骤、预期结果、验收命令**——coding agent 拿到就能写脚本
 2. **验收标准用 tmux send-keys 模拟键盘、curl 模拟 HTTP、tmux capture-pane 读取输出**——不需要人工
 3. **每个 case 独立**——不依赖其他 case 的副作用（除非显式标注依赖链）
+4. **测试必须覆盖所有用户可达路径，不只测快乐路径**——见下方复盘
+
+## 复盘：T6/T7 为什么没发现 patrol adopt 的 bug
+
+### 事件
+2026-05-25，用户报告 claude Read 工具被无脑拦截。根因：`adoptDiscoveredWorker()` 写了磁盘但没通知 daemon 注册到内存 registry。Hook 请求到达 daemon，找不到 worker，返回 `ask`。
+
+### 为什么 19 个 E2E 测试全部 PASS 但没发现
+T6（Claude hook safe tool → allow）和 T7（Claude hook dangerous tool → queued）的测试方式：
+```bash
+CLAUDE_WORKER=$(node bin/workboss.js list 2>&1 | grep 'claude' | head -1 | awk '{print $2}')
+curl -X POST "http://127.0.0.1:58212/claude-hook/${CLAUDE_WORKER}" ...
+```
+
+这个 worker 是 **daemon 启动时从磁盘加载并注册的**（daemon.ts:248-260）。所以 daemon 的 registry 里有它，hook 返回 allow。
+
+但用户的真实场景是：
+1. 用户在终端手动启动 `claude`
+2. daemon patrol 60s sweep 发现进程
+3. `adoptDiscoveredWorker()` 写磁盘 → **没有通知 daemon 注册**
+4. claude 发 hook → daemon 不认识 → 返回 ask → **用户被弹权限确认框**
+
+**我测试了路径 A（daemon 启动加载），没测路径 B（patrol 运行时 adopt）。两条路径的代码分支不同。**
+
+### 根本原因
+1. **测实现路径，不测用户场景**。我想的是"hook 功能能不能工作"，不是"用户实际是怎么触发 hook 的"。
+2. **挑选容易的测**。手动指定 worker name 一行 curl 就搞定，而 patrol 路径要等 60s sweep、还要有真实 claude 进程。我选了省事的。
+3. **PASS 数字带来的虚假安全感**。"19/19 PASS"的大表格让我和用户都以为没问题，实际上覆盖面有盲区。
+
+### 设计原则修正
+以后每个功能的 E2E 必须列出 **所有用户可达的代码路径**，每条路径至少一个 case：
+
+| 功能 | 路径 A | 路径 B | 路径 C |
+|------|--------|--------|--------|
+| Claude hook | daemon 启动注册的 worker | patrol adopt 的 worker | 用户手动 register 的 worker |
+| Worker spawn | CLI spawn | dashboard 内创建 | - |
+| Worker remove | CLI remove | dashboard 按 'x' | - |
+| Briefing | opencode SQLite | claude JSONL | 无 session 数据的 worker |
+
+**只有所有路径都覆盖了，才能声称"测试通过"。**
 
 ## 环境准备
 
@@ -668,6 +708,11 @@ Bug 历史：`adoptDiscoveredWorker()` 写了磁盘但没通知 daemon 注册到
 导致 auto-adopted worker 的 hook 请求被 daemon 拒绝（返回 ask 而非 allow）。
 **所有之前的 E2E 测试都用了手动 register 的 worker（有 notifyAggregator），从未覆盖 patrol adopt 路径。**
 
+### 路径覆盖
+- ✅ Worker 注册路径 A：daemon 启动从磁盘加载（T6/T7 隐式覆盖）
+- ✅ Worker 注册路径 B：用户手动 `register`（有 notifyAggregator RPC）
+- **本 case 覆盖路径 C**：patrol 自动 adopt（之前无覆盖）
+
 ### 前置
 - daemon 运行中
 - 有至少 1 个 claude 进程在跑（workboss 外部启动的）
@@ -684,37 +729,12 @@ Bug 历史：`adoptDiscoveredWorker()` 写了磁盘但没通知 daemon 注册到
 
 ### 验收命令
 ```bash
-# 方法 1：重启 daemon 后验证所有 claude worker 的 hook
 node bin/workboss.js server restart >/dev/null 2>&1
 sleep 3
 CLAUDE_WORKER=$(node bin/workboss.js list 2>&1 | grep 'up.*claude' | head -1 | awk '{print $2}')
 if [ -z "$CLAUDE_WORKER" ]; then echo "T25 SKIP: no alive claude worker"; exit 0; fi
 RESULT=$(curl -sf -X POST "http://127.0.0.1:58212/claude-hook/${CLAUDE_WORKER}" -H 'Content-Type: application/json' -d '{"session_id":"t","tool_name":"Read","tool_input":{"file_path":"/t"}}')
 echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['hookSpecificOutput']['permissionDecision']=='allow', f'got {d}'; print('T25 PASS')" || echo "T25 FAIL: $RESULT"
-```
-
-### 方法 2：spawn + 等待 patrol（更完整的验证）
-```bash
-# 1. 启动一个 opencode serve（模拟外部进程）
-mkdir -p /tmp/wb-patrol-test
-opencode serve --port 19999 &
-SERVE_PID=$!
-sleep 2
-
-# 2. 重启 daemon，让 patrol 发现这个进程
-node bin/workboss.js server restart >/dev/null 2>&1
-sleep 65  # 等待 patrol sweep（60s 间隔）
-
-# 3. 找到被 adopt 的 worker
-PATROL_WORKER=$(node bin/workboss.js list 2>&1 | grep '19999' | awk '{print $2}')
-
-# 4. 验证 daemon registry 包含这个 worker
-REG_COUNT=$(curl -sf -X POST http://127.0.0.1:58212/rpc -H 'Content-Type: application/json' -d '{"kind":"ping"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['workers'])")
-echo "Registered workers: $REG_COUNT"
-[ -n "$PATROL_WORKER" ] && echo "T25 PASS: patrol adopted $PATROL_WORKER" || echo "T25 CHECK: worker not adopted yet"
-
-# cleanup
-kill $SERVE_PID 2>/dev/null; node bin/workboss.js remove "$PATROL_WORKER" 2>/dev/null; rm -rf /tmp/wb-patrol-test
 ```
 
 ---
