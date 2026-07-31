@@ -13,6 +13,26 @@
  *
  * If a settings.local.json already exists we merge non-destructively — we
  * only overwrite the keys we own.
+ *
+ * ## Hook 请求的完整路径（E2E 必须全部覆盖）
+ *
+ * Claude 进程发 PreToolUse hook → settings.local.json 里的 URL → daemon HTTP
+ * → dispatchHookRequest → registry.lookup(workerName) → adapter.handleHookRequest
+ *
+ * Worker 进入 registry 有三条路径，**每条路径都必须有 E2E 测试**：
+ *
+ * | 路径 | 触发方式 | registry 时机 | E2E case |
+ * |------|---------|--------------|----------|
+ * | A. daemon 启动加载 | server start | 启动时遍历 disk | T6/T7 |
+ * | B. 用户手动 register | CLI register | notifyAggregator RPC | T6/T7 |
+ * | C. patrol 自动 adopt | 60s sweep | adoptDiscoveredWorker | T25 |
+ *
+ * Bug 历史 (2026-05-25): 路径 C 的 adoptDiscoveredWorker() 写了磁盘但没发
+ * workers.attach RPC，导致 daemon registry 里没有这个 worker。Hook 到达后
+ * 返回 ask 而非 allow，用户被弹权限确认框。
+ *
+ * 另一个已知问题：同 cwd 多个 claude worker 共享一份 settings.local.json，
+ * 最后写入的 hook URL 覆盖前面的。见 T26。
  */
 
 import {promises as fs, existsSync} from 'fs';
